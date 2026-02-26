@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Network Monitor</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!-- ============================================================================ -->
+    <!-- Header -->
+    <!-- ============================================================================ -->
+    <header>
+      <div class="header__left">
+        <h1>Network <span>Monitor</span></h1>
+        <p>CLICK CHECK ON EACH CARD OR CHECK ALL AT ONCE</p>
+      </div>
+      <div class="header__right">
+        <button id="btn-add" class="btn btn--primary">+ Add Computer</button>
+        <button id="btn-ping-all" class="btn btn--outline">Check All</button>
+      </div>
+    </header>
+
+    <!-- ============================================================================ -->
+    <!-- Summary Statistics -->
+    <!-- ============================================================================ -->
+    <div class="summary">
+      <div class="summary__item summary__item--total">
+        <span class="summary__label">Total</span>
+        <span class="summary__value" id="count-total">—</span>
+      </div>
+      <div class="summary__item summary__item--online">
+        <span class="summary__label">Online</span>
+        <span class="summary__value" id="count-online">—</span>
+      </div>
+      <div class="summary__item summary__item--offline">
+        <span class="summary__label">Offline</span>
+        <span class="summary__value" id="count-offline">—</span>
+      </div>
+    </div>
+
+    <!-- ============================================================================ -->
+    <!-- Error Message -->
+    <!-- ============================================================================ -->
+    <div id="error"></div>
+
+    <!-- ============================================================================ -->
+    <!-- Computer Grid -->
+    <!-- ============================================================================ -->
+    <div id="grid"></div>
+
+    <!-- ============================================================================ -->
+    <!-- Add Computer Modal -->
+    <!-- ============================================================================ -->
+    <div id="modal" class="modal">
+      <div class="modal__box">
+        <div class="modal__header">
+          <h2>Add Computer</h2>
+          <button id="modal-close" class="modal__close">✕</button>
+        </div>
+        <form id="add-form">
+          <div class="form__group">
+            <label for="form-id">ID</label>
+            <input id="form-id" type="text" placeholder="e.g. 3" required />
+          </div>
+          <div class="form__group">
+            <label for="form-name">Name</label>
+            <input id="form-name" type="text" placeholder="e.g. Office PC" required />
+          </div>
+          <div class="form__group">
+            <label for="form-ip">IP Address</label>
+            <input id="form-ip" type="text" placeholder="e.g. 192.168.68.110" required />
+          </div>
+          <button id="form-submit" type="submit" class="btn btn--primary btn--full">
+            Add Computer
+          </button>
+        </form>
+      </div>
+    </div>
+
+    <!-- ============================================================================ -->
+    <!-- Toast Notification -->
+    <!-- ============================================================================ -->
+    <div id="toast" class="toast"></div>
+
+    <!-- ============================================================================ -->
+    <!-- Scripts -->
+    <!-- ============================================================================ -->
+    <script src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,37 @@
+# Ignore build and dependencies
+bin/
+obj/
+dist/
+vendor/
+*.mod
+*.sum
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Ignore system files
+Thumbs.db
+.env.local
+
+# Ignore logs
+*.log
+logs/
+
+# Ignore temporary files
+tmp/
+temp/
+*.tmp
+
+# Ignore OS specific
+.DS_Store
+._.DS_Store
+*.exe
+*.o
+*.a
+*.so
+.so

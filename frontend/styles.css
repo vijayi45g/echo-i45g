@@ -1,0 +1,619 @@
+/**
+ * ============================================================================
+ * Network PC Monitoring System - Stylesheet
+ * ============================================================================
+ * Modern, dark-themed UI with responsive design for network monitoring
+ * ============================================================================
+ */
+
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Syne:wght@400;600;800&display=swap');
+
+/* ============================================================================
+   Design System - Color Palette & Typography
+   ============================================================================ */
+
+:root {
+  /* Colors */
+  --bg: #0a0c10;
+  --surface: #111318;
+  --border: #1e2230;
+  --on: #00e87a;
+  --on-dim: rgba(0, 232, 122, 0.10);
+  --off: #ff3b5c;
+  --off-dim: rgba(255, 59, 92, 0.10);
+  --idle: #5b7fff;
+  --idle-dim: rgba(91, 127, 255, 0.08);
+  --text: #e8eaf0;
+  --muted: #4a5068;
+  --accent: #5b7fff;
+
+  /* Typography */
+  --mono: 'Share Tech Mono', monospace;
+  --sans: 'Syne', sans-serif;
+}
+
+/* ============================================================================
+   Global Styles
+   ============================================================================ */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  min-height: 100vh;
+  padding: 2rem;
+  background-image: radial-gradient(ellipse 80% 50% at 50% -10%, rgba(91, 127, 255, 0.08), transparent);
+}
+
+/* ============================================================================
+   Header
+   ============================================================================ */
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 2.5rem;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.header__left h1 {
+  font-size: 1.75rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: #fff;
+}
+
+.header__left h1 span {
+  color: var(--accent);
+}
+
+.header__left p {
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  color: var(--muted);
+  margin-top: 0.25rem;
+  letter-spacing: 0.05em;
+}
+
+.header__right {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+/* ============================================================================
+   Buttons
+   ============================================================================ */
+
+.btn {
+  font-family: var(--sans);
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 0.55rem 1.1rem;
+  border-radius: 7px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.btn--primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+.btn--primary:hover {
+  background: #4a6cf0;
+}
+
+.btn--outline {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.btn--outline:hover {
+  border-color: var(--accent);
+  background: var(--idle-dim);
+}
+
+.btn--full {
+  width: 100%;
+  justify-content: center;
+  margin-top: 0.5rem;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ============================================================================
+   Summary Statistics
+   ============================================================================ */
+
+.summary {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 2rem;
+  flex-wrap: wrap;
+}
+
+.summary__item {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.9rem 1.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 110px;
+}
+
+.summary__label {
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+}
+
+.summary__value {
+  font-size: 1.6rem;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.summary__item--online .summary__value {
+  color: var(--on);
+}
+
+.summary__item--offline .summary__value {
+  color: var(--off);
+}
+
+.summary__item--total .summary__value {
+  color: var(--text);
+}
+
+/* ============================================================================
+   Error Messages
+   ============================================================================ */
+
+#error {
+  display: none;
+  background: rgba(255, 59, 92, 0.08);
+  border: 1px solid var(--off);
+  color: var(--off);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  margin-bottom: 1.5rem;
+}
+
+/* ============================================================================
+   Grid Layout
+   ============================================================================ */
+
+#grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  gap: 1.25rem;
+}
+
+/* ============================================================================
+   Computer Cards
+   ============================================================================ */
+
+.card {
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: 1.25rem;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  grid-template-rows: auto auto;
+  column-gap: 0.9rem;
+  row-gap: 0.9rem;
+  align-items: center;
+  transition: border-color 0.3s, box-shadow 0.3s, transform 0.2s;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Card background overlay based on status */
+.card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  transition: opacity 0.3s;
+  opacity: 0;
+}
+
+.card--on::before {
+  background: var(--on-dim);
+  opacity: 1;
+}
+
+.card--off::before {
+  background: var(--off-dim);
+  opacity: 1;
+}
+
+.card--idle::before {
+  background: var(--idle-dim);
+  opacity: 1;
+}
+
+/* Card border colors */
+.card--on {
+  border-color: rgba(0, 232, 122, 0.3);
+}
+
+.card--off {
+  border-color: rgba(255, 59, 92, 0.25);
+}
+
+.card--idle {
+  border-color: rgba(91, 127, 255, 0.2);
+}
+
+/* Card hover effects */
+.card--on:hover {
+  box-shadow: 0 0 24px rgba(0, 232, 122, 0.12);
+  transform: translateY(-2px);
+}
+
+.card--off:hover {
+  box-shadow: 0 0 24px rgba(255, 59, 92, 0.10);
+  transform: translateY(-2px);
+}
+
+.card--idle:hover {
+  box-shadow: 0 0 24px rgba(91, 127, 255, 0.10);
+  transform: translateY(-2px);
+}
+
+/* Status indicator dot */
+.card__indicator {
+  grid-column: 1;
+  grid-row: 1;
+  position: relative;
+  z-index: 1;
+}
+
+.card__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: block;
+}
+
+.card--on .card__dot {
+  background: var(--on);
+  box-shadow: 0 0 8px var(--on);
+  animation: blink 2s ease-in-out infinite;
+}
+
+.card--off .card__dot {
+  background: var(--off);
+  box-shadow: 0 0 6px var(--off);
+}
+
+.card--idle .card__dot {
+  background: var(--muted);
+}
+
+@keyframes blink {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* Card body (name and IP) */
+.card__body {
+  grid-column: 2;
+  grid-row: 1;
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+}
+
+.card__name {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.card__ip {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--muted);
+  margin-top: 0.15rem;
+}
+
+/* Card status badge */
+.card__status {
+  grid-column: 3;
+  grid-row: 1;
+  position: relative;
+  z-index: 1;
+}
+
+.card__badge {
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  padding: 0.28rem 0.6rem;
+  border-radius: 5px;
+}
+
+.card--on .card__badge {
+  background: rgba(0, 232, 122, 0.15);
+  color: var(--on);
+  border: 1px solid rgba(0, 232, 122, 0.3);
+}
+
+.card--off .card__badge {
+  background: rgba(255, 59, 92, 0.15);
+  color: var(--off);
+  border: 1px solid rgba(255, 59, 92, 0.3);
+}
+
+.card--idle .card__badge {
+  background: rgba(91, 127, 255, 0.12);
+  color: var(--idle);
+  border: 1px solid rgba(91, 127, 255, 0.25);
+}
+
+/* Card footer (time and check button) */
+.card__footer {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  position: relative;
+  z-index: 1;
+  border-top: 1px solid var(--border);
+  padding-top: 0.8rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.card__time {
+  font-family: var(--mono);
+  font-size: 0.63rem;
+  color: var(--muted);
+}
+
+/* Check button inside cards */
+.btn-check {
+  font-family: var(--sans);
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.35rem 0.8rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.btn-check:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--idle-dim);
+}
+
+.btn-check:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ============================================================================
+   Loading Spinner
+   ============================================================================ */
+
+.spinner {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ============================================================================
+   Modal Dialog
+   ============================================================================ */
+
+.modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal--open {
+  display: flex;
+}
+
+.modal__box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 1.75rem;
+  width: 100%;
+  max-width: 420px;
+  animation: slideup 0.25s ease;
+}
+
+@keyframes slideup {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.modal__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1.5rem;
+}
+
+.modal__header h2 {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: #fff;
+}
+
+.modal__close {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 1rem;
+  cursor: pointer;
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+}
+
+.modal__close:hover {
+  color: var(--text);
+}
+
+/* ============================================================================
+   Form Styles
+   ============================================================================ */
+
+.form__group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-bottom: 1rem;
+}
+
+.form__group label {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.form__group input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 0.65rem 0.9rem;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 0.88rem;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.form__group input:focus {
+  border-color: var(--accent);
+}
+
+.form__group input::placeholder {
+  color: var(--muted);
+}
+
+/* ============================================================================
+   Toast Notifications
+   ============================================================================ */
+
+.toast {
+  position: fixed;
+  bottom: 2rem;
+  left: 50%;
+  transform: translateX(-50%) translateY(10px);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  padding: 0.7rem 1.25rem;
+  border-radius: 8px;
+  opacity: 0;
+  transition: all 0.3s;
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 200;
+}
+
+.toast--show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.toast--success {
+  border-color: rgba(0, 232, 122, 0.4);
+  color: var(--on);
+}
+
+.toast--error {
+  border-color: rgba(255, 59, 92, 0.4);
+  color: var(--off);
+}
+
+/* ============================================================================
+   Responsive Design
+   ============================================================================ */
+
+@media (max-width: 600px) {
+  body {
+    padding: 1rem;
+  }
+
+  header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .card__footer {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
