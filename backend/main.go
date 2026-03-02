@@ -1,12 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/user"
+	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 )
 
 // ============================================================================
@@ -18,18 +29,20 @@ import (
 
 // Computer represents a network computer in the monitoring system
 type Computer struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	IP   string `json:"ip"`
+	ID       string `json:"id"`
+	Place    string `json:"place"`
+	Username string `json:"username"`
+	IP       string `json:"ip"`
 }
 
 // ComputerStatus contains the current status of a computer after a ping check
 type ComputerStatus struct {
 	ID        string `json:"id"`
-	Name      string `json:"name"`
+	Place     string `json:"place"`
+	Username  string `json:"username"`
 	IP        string `json:"ip"`
-	Status    string `json:"status"`      // "ON" or "OFF"
-	CheckedAt string `json:"checkedAt"`   // Timestamp of last check
+	Status    string `json:"status"`    // "ON" or "OFF"
+	CheckedAt string `json:"checkedAt"` // Timestamp of last check
 }
 
 // APIResponse is the standard response format for all API endpoints
@@ -43,11 +56,8 @@ type APIResponse struct {
 // Global State
 // ============================================================================
 
-// computers is the in-memory store of computers being monitored
-// In production, this should be persisted to a database
-var computers = []Computer{
-	{ID: "1", Name: "Cabin 12", IP: "192.168.68.92"},
-}
+// Database path - stores SQLite database file
+const dbPath = "monitoring.db"
 
 // ============================================================================
 // Network Utilities
@@ -72,7 +82,7 @@ func pingHost(ip string) string {
 // setCORS configures CORS headers for cross-origin requests
 func setCORS(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	w.Header().Set("Content-Type", "application/json")
 }
@@ -93,11 +103,21 @@ func writeJSON(w http.ResponseWriter, code int, payload interface{}) {
 // Returns all computers in the monitoring system
 func listComputers(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
+
+	computers, err := getComputers()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   "Failed to retrieve computers",
+		})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, APIResponse{
 		Success: true,
 		Data:    computers,
 	})
-	log.Println("INFO: Listed all computers")
+	log.Println("INFO: Listed all computers from database")
 }
 
 // addComputer handles POST /api/computers
@@ -117,34 +137,39 @@ func addComputer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate required fields
-	if c.ID == "" || c.Name == "" || c.IP == "" {
+	if c.ID == "" || c.Place == "" || c.Username == "" || c.IP == "" {
 		writeJSON(w, http.StatusBadRequest, APIResponse{
 			Success: false,
-			Error:   "id, name and ip are required",
+			Error:   "id, place, username and ip are required",
 		})
 		log.Println("WARNING: Attempt to add computer with missing fields")
 		return
 	}
 
 	// Check for duplicate ID
-	for _, existing := range computers {
-		if existing.ID == c.ID {
-			writeJSON(w, http.StatusConflict, APIResponse{
-				Success: false,
-				Error:   "Computer with this ID already exists",
-			})
-			log.Printf("WARNING: Attempt to add duplicate computer ID: %s", c.ID)
-			return
-		}
+	if computerExists(c.ID) {
+		writeJSON(w, http.StatusConflict, APIResponse{
+			Success: false,
+			Error:   "Computer with this ID already exists",
+		})
+		log.Printf("WARNING: Attempt to add duplicate computer ID: %s", c.ID)
+		return
 	}
 
-	// Add the new computer
-	computers = append(computers, c)
+	// Add the new computer to database
+	if err := createComputer(c); err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   "Failed to save computer to database",
+		})
+		return
+	}
+
 	writeJSON(w, http.StatusCreated, APIResponse{
 		Success: true,
 		Data:    c,
 	})
-	log.Printf("INFO: Computer added - ID: %s, Name: %s, IP: %s", c.ID, c.Name, c.IP)
+	log.Printf("INFO: Computer added to database - ID: %s, Place: %s, Username: %s, IP: %s", c.ID, c.Place, c.Username, c.IP)
 }
 
 // pingOne handles GET /api/ping/:id
@@ -162,13 +187,24 @@ func pingOne(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get computers from database
+	computers, err := getComputers()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   "Failed to retrieve computers",
+		})
+		return
+	}
+
 	// Find and ping the computer
 	for _, c := range computers {
 		if c.ID == id {
 			status := pingHost(c.IP)
 			result := ComputerStatus{
 				ID:        c.ID,
-				Name:      c.Name,
+				Place:     c.Place,
+				Username:  c.Username,
 				IP:        c.IP,
 				Status:    status,
 				CheckedAt: time.Now().Format("2006-01-02 15:04:05"),
@@ -177,7 +213,7 @@ func pingOne(w http.ResponseWriter, r *http.Request) {
 				Success: true,
 				Data:    result,
 			})
-			log.Printf("INFO: Pinged computer %s (%s) - Status: %s", c.Name, c.IP, status)
+			log.Printf("INFO: Pinged computer %s (%s) - Status: %s", c.Place, c.IP, status)
 			return
 		}
 	}
@@ -195,14 +231,25 @@ func pingOne(w http.ResponseWriter, r *http.Request) {
 func pingAll(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 
+	// Get all computers from database
+	computers, err := getComputers()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   "Failed to retrieve computers",
+		})
+		return
+	}
+
 	now := time.Now().Format("2006-01-02 15:04:05")
 	var results []ComputerStatus
 
-	// Ping all computers concurrently
+	// Ping all computers
 	for _, c := range computers {
 		results = append(results, ComputerStatus{
 			ID:        c.ID,
-			Name:      c.Name,
+			Place:     c.Place,
+			Username:  c.Username,
 			IP:        c.IP,
 			Status:    pingHost(c.IP),
 			CheckedAt: now,
@@ -224,6 +271,498 @@ func pingAll(w http.ResponseWriter, r *http.Request) {
 	log.Printf("INFO: Pinged all %d computers - Online: %d, Offline: %d", len(computers), onCount, len(computers)-onCount)
 }
 
+// editComputer handles PUT /api/computers/:id
+// Updates an existing computer's information
+func editComputer(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+
+	// Extract computer ID from URL path
+	id := strings.TrimPrefix(r.URL.Path, "/api/computers/")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "Missing computer ID",
+		})
+		return
+	}
+
+	// Parse request body
+	var c Computer
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "Invalid JSON body",
+		})
+		log.Printf("ERROR: Failed to decode computer data: %v", err)
+		return
+	}
+
+	// Validate required fields
+	if c.Place == "" || c.Username == "" || c.IP == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "place, username and ip are required",
+		})
+		return
+	}
+
+	// Set the ID and update
+	c.ID = id
+	if err := updateComputer(c); err != nil {
+		writeJSON(w, http.StatusNotFound, APIResponse{
+			Success: false,
+			Error:   "Computer not found",
+		})
+		log.Printf("WARNING: Attempt to update non-existent computer ID: %s", id)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data:    c,
+	})
+	log.Printf("INFO: Computer updated - ID: %s, Place: %s, Username: %s, IP: %s", c.ID, c.Place, c.Username, c.IP)
+}
+
+// deleteComputerHandler handles DELETE /api/computers/:id
+// Deletes a computer from the monitoring system
+func deleteComputerHandler(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+
+	// Extract computer ID from URL path
+	id := strings.TrimPrefix(r.URL.Path, "/api/computers/")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "Missing computer ID",
+		})
+		return
+	}
+
+	// Delete the computer
+	if err := deleteComputer(id); err != nil {
+		writeJSON(w, http.StatusNotFound, APIResponse{
+			Success: false,
+			Error:   "Computer not found",
+		})
+		log.Printf("WARNING: Attempt to delete non-existent computer ID: %s", id)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data:    map[string]string{"id": id},
+	})
+	log.Printf("INFO: Computer deleted - ID: %s", id)
+}
+
+// ============================================================================
+// SSH Terminal Execution
+// ============================================================================
+
+// TerminalRequest represents a request to execute a command via SSH
+type TerminalRequest struct {
+	ComputerID string `json:"computerId"`
+	Command    string `json:"command"`
+	Username   string `json:"username,omitempty"`
+}
+
+// TerminalResponse represents the response from SSH command execution
+type TerminalResponse struct {
+	Output string `json:"output"`
+	Error  string `json:"error,omitempty"`
+}
+
+// getSSHConfig loads SSH private key(s) from disk (no SSH agent)
+func getSSHConfig(username string) ([]ssh.AuthMethod, error) {
+	var authMethods []ssh.AuthMethod
+
+	if username == "" {
+		username = "root"
+	}
+
+	// IMPORTANT: do NOT use SSH_AUTH_SOCK / ssh-agent here.
+	// We rely only on private key files from disk.
+
+	usr, err := user.Current()
+	if err != nil {
+		log.Printf("WARNING: Failed to get current user: %v", err)
+	} else {
+		keyPaths := []string{
+			filepath.Join(usr.HomeDir, ".ssh", "id_rsa"),
+			filepath.Join(usr.HomeDir, ".ssh", "id_ed25519"),
+			filepath.Join(usr.HomeDir, ".ssh", "id_ecdsa"),
+		}
+
+		// Also try explicit paths for your user/root
+		keyPaths = append(keyPaths,
+			"/root/.ssh/id_rsa",
+			"/root/.ssh/id_ed25519",
+			"/home/sysadmin007/.ssh/id_rsa",
+			"/home/sysadmin007/.ssh/id_ed25519",
+		)
+
+		for _, keyPath := range keyPaths {
+			key, err := os.ReadFile(keyPath)
+			if err != nil {
+				continue
+			}
+
+			signer, err := ssh.ParsePrivateKey(key)
+			if err != nil {
+				log.Printf("WARNING: Failed to parse key at %s: %v", keyPath, err)
+				continue
+			}
+
+			authMethods = append(authMethods, ssh.PublicKeys(signer))
+			log.Printf("INFO: Loaded SSH key from %s", keyPath)
+		}
+	}
+
+	if len(authMethods) == 0 {
+		return nil, errors.New("no SSH keys found - ensure SSH keys are in ~/.ssh/")
+	}
+
+	return authMethods, nil
+}
+
+	// Also support SSH key files in PEM format
+	pemPath := filepath.Join(os.Getenv("HOME"), ".ssh")
+	if entries, err := os.ReadDir(pemPath); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+				fullPath := filepath.Join(pemPath, entry.Name())
+				key, err := os.ReadFile(fullPath)
+				if err != nil {
+					continue
+				}
+
+				block, _ := pem.Decode(key)
+				if block != nil && (strings.Contains(block.Type, "RSA") || strings.Contains(block.Type, "PRIVATE")) {
+					signer, err := ssh.ParsePrivateKey(key)
+					if err == nil {
+						authMethods = append(authMethods, ssh.PublicKeys(signer))
+						log.Printf("INFO: Loaded SSH key from %s", fullPath)
+					}
+				}
+			}
+		}
+	}
+
+	if len(authMethods) == 0 {
+		return nil, errors.New("no SSH keys found - ensure SSH keys are in ~/.ssh/")
+	}
+
+	return authMethods, nil
+}
+
+// executeSSHCommand connects to a remote computer via SSH and executes a command
+func executeSSHCommand(ip, username, command string) (string, error) {
+	if username == "" {
+		username = "root"
+	}
+
+	authMethods, err := getSSHConfig(username)
+	if err != nil {
+		log.Printf("ERROR: Failed to get SSH config: %v", err)
+		return "", err
+	}
+
+	config := &ssh.ClientConfig{
+		User:            username,
+		Auth:            authMethods,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // ⚠️ Only for trusted internal networks
+		Timeout:         10 * time.Second,
+	}
+
+	client, err := ssh.Dial("tcp", net.JoinHostPort(ip, "22"), config)
+	if err != nil {
+		log.Printf("ERROR: Failed to connect to %s: %v", ip, err)
+		return "", fmt.Errorf("SSH connection failed: %w", err)
+	}
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		log.Printf("ERROR: Failed to create SSH session for %s: %v", ip, err)
+		return "", fmt.Errorf("SSH session failed: %w", err)
+	}
+	defer session.Close()
+
+	var stdout, stderr bytes.Buffer
+	session.Stdout = &stdout
+	session.Stderr = &stderr
+
+	if err := session.Run(command); err != nil {
+		log.Printf("WARNING: SSH command failed on %s: %v", ip, err)
+		stderrText := stderr.String()
+		if stderrText != "" {
+			return stderrText, nil
+		}
+		return "", fmt.Errorf("command execution failed: %w", err)
+	}
+
+	output := stdout.String()
+	log.Printf("INFO: SSH command executed on %s - Command: %s - Output length: %d", ip, command, len(output))
+	return output, nil
+}
+
+// executeTerminal handles POST /api/terminal/execute
+func executeTerminal(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+
+	var req TerminalRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "Invalid JSON body",
+		})
+		log.Printf("ERROR: Failed to decode terminal request: %v", err)
+		return
+	}
+
+	if req.ComputerID == "" || req.Command == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "computerId and command are required",
+		})
+		return
+	}
+
+	computers, err := getComputers()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   "Failed to retrieve computers",
+		})
+		return
+	}
+
+	var computer *Computer
+	for i := range computers {
+		if computers[i].ID == req.ComputerID {
+			computer = &computers[i]
+			break
+		}
+	}
+
+	if computer == nil {
+		writeJSON(w, http.StatusNotFound, APIResponse{
+			Success: false,
+			Error:   "Computer not found",
+		})
+		log.Printf("WARNING: Attempt to execute terminal command on non-existent computer: %s", req.ComputerID)
+		return
+	}
+
+	output, err := executeSSHCommand(computer.IP, computer.Username, req.Command)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("SSH execution failed: %v", err),
+		})
+		log.Printf("ERROR: SSH command execution failed for %s@%s (%s): %v", computer.Username, computer.Place, computer.IP, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: TerminalResponse{
+			Output: output,
+		},
+	})
+	log.Printf("INFO: Terminal command executed on %s@%s (%s) - Command: %s", computer.Username, computer.Place, computer.IP, req.Command)
+}
+
+// ============================================================================
+// WebSocket SSH Terminal
+// ============================================================================
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Allow all origins for internal network use
+	},
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+}
+
+// handleTerminalWS handles GET /api/terminal/ws?computerId=xxx
+// Upgrades HTTP to WebSocket and bridges it to a persistent SSH PTY session
+func handleTerminalWS(w http.ResponseWriter, r *http.Request) {
+	computerID := r.URL.Query().Get("computerId")
+	if computerID == "" {
+		http.Error(w, "computerId query param required", http.StatusBadRequest)
+		return
+	}
+
+	computers, err := getComputers()
+	if err != nil {
+		http.Error(w, "Failed to retrieve computers", http.StatusInternalServerError)
+		return
+	}
+
+	var computer *Computer
+	for i := range computers {
+		if computers[i].ID == computerID {
+			computer = &computers[i]
+			break
+		}
+	}
+
+	if computer == nil {
+		http.Error(w, "Computer not found", http.StatusNotFound)
+		return
+	}
+
+	// Upgrade HTTP → WebSocket
+	wsConn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("ERROR: WebSocket upgrade failed for computerId=%s: %v", computerID, err)
+		return
+	}
+	defer wsConn.Close()
+
+	log.Printf("INFO: WebSocket terminal opened for %s@%s (%s)", computer.Username, computer.Place, computer.IP)
+
+	// Let the browser/user know which target we are trying to reach
+	wsConn.WriteMessage(
+		websocket.TextMessage,
+		[]byte(fmt.Sprintf("Connecting to %s@%s via SSH...\r\n", computer.Username, computer.IP)),
+	)
+
+	authMethods, err := getSSHConfig(computer.Username)
+	if err != nil {
+		log.Printf("ERROR: SSH key error for %s@%s (%s): %v", computer.Username, computer.Place, computer.IP, err)
+		wsConn.WriteMessage(websocket.TextMessage, []byte("SSH key error: "+err.Error()+"\r\n"))
+		return
+	}
+
+	sshConfig := &ssh.ClientConfig{
+		User:            computer.Username,
+		Auth:            authMethods,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // ⚠️ Only for trusted internal networks
+		Timeout:         10 * time.Second,
+	}
+
+	sshClient, err := ssh.Dial("tcp", net.JoinHostPort(computer.IP, "22"), sshConfig)
+	if err != nil {
+		log.Printf("ERROR: SSH connection failed for %s@%s (%s): %v", computer.Username, computer.Place, computer.IP, err)
+		wsConn.WriteMessage(websocket.TextMessage, []byte("SSH connection failed: "+err.Error()+"\r\n"))
+		return
+	}
+	defer sshClient.Close()
+
+	session, err := sshClient.NewSession()
+	if err != nil {
+		log.Printf("ERROR: SSH session failed for %s@%s (%s): %v", computer.Username, computer.Place, computer.IP, err)
+		wsConn.WriteMessage(websocket.TextMessage, []byte("SSH session failed: "+err.Error()+"\r\n"))
+		return
+	}
+	defer session.Close()
+
+	// Request a PTY — this is what makes it an interactive terminal
+	modes := ssh.TerminalModes{
+		ssh.ECHO:          1,
+		ssh.TTY_OP_ISPEED: 14400,
+		ssh.TTY_OP_OSPEED: 14400,
+	}
+	if err := session.RequestPty("xterm-256color", 40, 120, modes); err != nil {
+		log.Printf("ERROR: PTY request failed for %s@%s (%s): %v", computer.Username, computer.Place, computer.IP, err)
+		wsConn.WriteMessage(websocket.TextMessage, []byte("PTY request failed: "+err.Error()+"\r\n"))
+		return
+	}
+
+	sshOut, err := session.StdoutPipe()
+	if err != nil {
+		log.Printf("ERROR: stdout pipe failed for %s@%s (%s): %v", computer.Username, computer.Place, computer.IP, err)
+		wsConn.WriteMessage(websocket.TextMessage, []byte("Pipe error: "+err.Error()+"\r\n"))
+		return
+	}
+	sshErr, err := session.StderrPipe()
+	if err != nil {
+		log.Printf("ERROR: stderr pipe failed for %s@%s (%s): %v", computer.Username, computer.Place, computer.IP, err)
+		wsConn.WriteMessage(websocket.TextMessage, []byte("Pipe error: "+err.Error()+"\r\n"))
+		return
+	}
+	sshIn, err := session.StdinPipe()
+	if err != nil {
+		log.Printf("ERROR: stdin pipe failed for %s@%s (%s): %v", computer.Username, computer.Place, computer.IP, err)
+		wsConn.WriteMessage(websocket.TextMessage, []byte("Pipe error: "+err.Error()+"\r\n"))
+		return
+	}
+
+	if err := session.Shell(); err != nil {
+		log.Printf("ERROR: shell start failed for %s@%s (%s): %v", computer.Username, computer.Place, computer.IP, err)
+		wsConn.WriteMessage(websocket.TextMessage, []byte("Shell start failed: "+err.Error()+"\r\n"))
+		return
+	}
+
+	// Clear message that SSH is ready and where commands go
+	wsConn.WriteMessage(
+		websocket.TextMessage,
+		[]byte(fmt.Sprintf("SSH session established. Commands now run on %s@%s.\r\n\r\n", computer.Username, computer.IP)),
+	)
+
+	done := make(chan struct{})
+
+	// SSH stdout → WebSocket
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := sshOut.Read(buf)
+			if n > 0 {
+				if writeErr := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); writeErr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		close(done)
+	}()
+
+	// SSH stderr → WebSocket
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := sshErr.Read(buf)
+			if n > 0 {
+				wsConn.WriteMessage(websocket.BinaryMessage, buf[:n])
+			}
+			if err != nil {
+				break
+			}
+		}
+	}()
+
+	// WebSocket → SSH stdin (main loop)
+	for {
+		_, msg, err := wsConn.ReadMessage()
+		if err != nil {
+			break
+		}
+		// Handle terminal resize: {"type":"resize","cols":120,"rows":40}
+		if len(msg) > 0 && msg[0] == '{' {
+			var resizeMsg struct {
+				Type string `json:"type"`
+				Cols uint32 `json:"cols"`
+				Rows uint32 `json:"rows"`
+			}
+			if json.Unmarshal(msg, &resizeMsg) == nil && resizeMsg.Type == "resize" {
+				session.WindowChange(int(resizeMsg.Rows), int(resizeMsg.Cols))
+				continue
+			}
+		}
+		if _, err := sshIn.Write(msg); err != nil {
+			break
+		}
+	}
+
+	<-done
+	log.Printf("INFO: WebSocket terminal closed for %s@%s", computer.Username, computer.Place)
+}
+
 // ============================================================================
 // Router
 // ============================================================================
@@ -239,18 +778,24 @@ func router(w http.ResponseWriter, r *http.Request) {
 
 	path := r.URL.Path
 
-	// Route to appropriate handler
 	switch {
 	case path == "/api/computers" && r.Method == http.MethodGet:
 		listComputers(w, r)
 	case path == "/api/computers" && r.Method == http.MethodPost:
 		addComputer(w, r)
+	case strings.HasPrefix(path, "/api/computers/") && r.Method == http.MethodPut:
+		editComputer(w, r)
+	case strings.HasPrefix(path, "/api/computers/") && r.Method == http.MethodDelete:
+		deleteComputerHandler(w, r)
 	case strings.HasPrefix(path, "/api/ping/") && r.Method == http.MethodGet:
 		pingOne(w, r)
 	case path == "/api/ping-all" && r.Method == http.MethodGet:
 		pingAll(w, r)
+	case path == "/api/terminal/execute" && r.Method == http.MethodPost:
+		executeTerminal(w, r)
+	case path == "/api/terminal/ws" && r.Method == http.MethodGet:
+		handleTerminalWS(w, r) // ✅ WebSocket route correctly placed here
 	default:
-		// Serve frontend static files
 		http.FileServer(http.Dir("../frontend")).ServeHTTP(w, r)
 	}
 }
@@ -260,17 +805,22 @@ func router(w http.ResponseWriter, r *http.Request) {
 // ============================================================================
 
 func main() {
+	// Initialize database
+	if err := initDatabase(dbPath); err != nil {
+		log.Fatalf("FATAL: Failed to initialize database: %v", err)
+	}
+	defer closeDatabase()
+
 	// Register router
 	http.HandleFunc("/", router)
 
-	// Server configuration
 	port := ":8081"
 	log.Printf("========================================")
 	log.Printf("Network PC Monitoring System - Started")
 	log.Printf("Server running at http://localhost%s", port)
+	log.Printf("Database: %s", dbPath)
 	log.Printf("========================================")
 
-	// Start server
 	if err := http.ListenAndServe(port, nil); err != nil {
 		log.Fatalf("FATAL: Server failed to start: %v", err)
 	}

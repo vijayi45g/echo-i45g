@@ -12,12 +12,13 @@
     <!-- ============================================================================ -->
     <header>
       <div class="header__left">
-        <h1>Network <span>Monitor</span></h1>
+        <h1>Echo <span>i45g</span></h1>
         <p>CLICK CHECK ON EACH CARD OR CHECK ALL AT ONCE</p>
       </div>
       <div class="header__right">
         <button id="btn-add" class="btn btn--primary">+ Add Computer</button>
         <button id="btn-ping-all" class="btn btn--outline">Check All</button>
+        <button id="btn-terminal-all" class="btn btn--outline">Run Command on All</button>
       </div>
     </header>
 
@@ -64,8 +65,12 @@
             <input id="form-id" type="text" placeholder="e.g. 3" required />
           </div>
           <div class="form__group">
-            <label for="form-name">Name</label>
-            <input id="form-name" type="text" placeholder="e.g. Office PC" required />
+            <label for="form-place">Place</label>
+            <input id="form-place" type="text" placeholder="e.g. Office PC" required />
+          </div>
+          <div class="form__group">
+            <label for="form-user-name">User Name</label>
+            <input id="form-user-name" type="text" placeholder="e.g. sysadmin" required />
           </div>
           <div class="form__group">
             <label for="form-ip">IP Address</label>
@@ -75,6 +80,121 @@
             Add Computer
           </button>
         </form>
+      </div>
+    </div>
+
+    <!-- ============================================================================ -->
+    <!-- Edit Computer Modal -->
+    <!-- ============================================================================ -->
+    <div id="edit-modal" class="modal">
+      <div class="modal__box">
+        <div class="modal__header">
+          <h2>Edit Computer</h2>
+          <button id="edit-modal-close" class="modal__close">✕</button>
+        </div>
+        <form id="edit-form">
+          <div class="form__group">
+            <label for="edit-form-id">ID</label>
+            <input id="edit-form-id" type="text" disabled />
+          </div>
+          <div class="form__group">
+            <label for="edit-form-place">Place</label>
+            <input id="edit-form-place" type="text" placeholder="e.g. Office PC" required />
+          </div>
+          <div class="form__group">
+            <label for="edit-form-user-name">User Name</label>
+            <input id="edit-form-user-name" type="text" placeholder="e.g. sysadmin" required />
+          </div>
+          <div class="form__group">
+            <label for="edit-form-ip">IP Address</label>
+            <input id="edit-form-ip" type="text" placeholder="e.g. 192.168.68.110" required />
+          </div>
+          <button id="edit-form-submit" type="submit" class="btn btn--primary btn--full">
+            Update Computer
+          </button>
+        </form>
+      </div>
+    </div>
+
+    <!-- ============================================================================ -->
+    <!-- Terminal Modal (Full Screen) -->
+    <!-- ============================================================================ -->
+    <div id="terminal-modal" class="terminal-modal">
+      <div class="terminal-modal__container">
+        <!-- Terminal Header -->
+        <div class="terminal-modal__header">
+          <div class="terminal-modal__title-bar">
+            <div class="terminal-modal__title">
+              <span class="terminal-modal__title-icon">⌘</span>
+              <span id="terminal-title">Terminal</span>
+            </div>
+            <button id="terminal-modal-close" class="terminal-modal__close-btn" title="Close (Esc)">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Terminal Output Area -->
+        <div class="terminal-modal__output-wrapper">
+          <div class="terminal-modal__output" id="terminal-output"></div>
+          <div class="terminal-modal__cursor"></div>
+        </div>
+
+        <!-- Terminal Input Bar + Status -->
+        <div class="terminal-modal__footer">
+          <div class="terminal-modal__input-group">
+            <span class="terminal-modal__prompt">$</span>
+            <input 
+              type="text" 
+              id="terminal-input" 
+              class="terminal-modal__input" 
+              placeholder="Type command here and press Enter (or type directly in the terminal)..."
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button id="terminal-send-btn" class="terminal-modal__send" title="Send (Enter)">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M22 2L11 13m11-11l-7 20L2 11l20-9z"/>
+              </svg>
+            </button>
+          </div>
+          <div class="terminal-modal__status-bar">
+            <span id="terminal-status">Ready</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================================================ -->
+    <!-- Multi-Command SSH Modal (Run on Many Computers) -->
+    <!-- ============================================================================ -->
+    <div id="multi-terminal-modal" class="modal">
+      <div class="modal__box multi-terminal__box">
+        <div class="modal__header">
+          <h2>Run Command on All Computers</h2>
+          <button id="multi-terminal-close" class="modal__close">✕</button>
+        </div>
+        <div class="multi-terminal__terminal">
+          <div class="multi-terminal__terminal-output" id="multi-terminal-log"></div>
+          <div class="multi-terminal__terminal-footer">
+            <span class="multi-terminal__prompt">$</span>
+            <input
+              id="multi-terminal-command"
+              type="text"
+              class="multi-terminal__input"
+              placeholder="Type a command to run on all systems (e.g. whoami, hostname, uptime)"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button id="multi-terminal-run" class="multi-terminal__send" title="Run on all">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M22 2L11 13m11-11l-7 20L2 11l20-9z"/>
+              </svg>
+            </button>
+          </div>
+        </div>
       </div>
     </div>
 
