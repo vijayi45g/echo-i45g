@@ -3,21 +3,21 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 )
 
 // ============================================================================
@@ -33,6 +33,7 @@ type Computer struct {
 	Place    string `json:"place"`
 	Username string `json:"username"`
 	IP       string `json:"ip"`
+	OS       string `json:"os"`
 }
 
 // ComputerStatus contains the current status of a computer after a ping check
@@ -373,6 +374,302 @@ type TerminalResponse struct {
 	Error  string `json:"error,omitempty"`
 }
 
+// SystemInfo contains host OS + memory/disk metrics from a remote Linux machine.
+type SystemInfo struct {
+	ComputerID         string  `json:"computerId"`
+	Place              string  `json:"place"`
+	Username           string  `json:"username"`
+	IP                 string  `json:"ip"`
+	OS                 string  `json:"os"`
+	MemoryTotalGB      float64 `json:"memoryTotalGB"`
+	MemoryUsedGB       float64 `json:"memoryUsedGB"`
+	MemoryUsagePercent float64 `json:"memoryUsagePercent"`
+	DiskTotalGB        float64 `json:"diskTotalGB"`
+	DiskUsedGB         float64 `json:"diskUsedGB"`
+	DiskUsagePercent   float64 `json:"diskUsagePercent"`
+	CollectedAt        string  `json:"collectedAt"`
+}
+
+type CPUCommandOutput struct {
+	Free  string `json:"free"`
+	LSCPU string `json:"lscpu"`
+	Dmesg string `json:"dmesg"`
+}
+
+type CPUOverview struct {
+	ComputerID         string           `json:"computerId"`
+	Place              string           `json:"place"`
+	Username           string           `json:"username"`
+	IP                 string           `json:"ip"`
+	OS                 string           `json:"os"`
+	Kernel             string           `json:"kernel"`
+	Uptime             string           `json:"uptime"`
+	Architecture       string           `json:"architecture"`
+	CPUModel           string           `json:"cpuModel"`
+	CoreCount          int              `json:"coreCount"`
+	ThreadsPerCore     int              `json:"threadsPerCore"`
+	SocketCount        int              `json:"socketCount"`
+	Load1              float64          `json:"load1"`
+	Load5              float64          `json:"load5"`
+	Load15             float64          `json:"load15"`
+	CPUUsagePercent    float64          `json:"cpuUsagePercent"`
+	MemoryTotalGB      float64          `json:"memoryTotalGB"`
+	MemoryUsedGB       float64          `json:"memoryUsedGB"`
+	MemoryUsagePercent float64          `json:"memoryUsagePercent"`
+	DiskTotalGB        float64          `json:"diskTotalGB"`
+	DiskUsedGB         float64          `json:"diskUsedGB"`
+	DiskUsagePercent   float64          `json:"diskUsagePercent"`
+	Commands           CPUCommandOutput `json:"commands"`
+	CollectedAt        string           `json:"collectedAt"`
+}
+
+func round2(v float64) float64 {
+	return math.Round(v*100) / 100
+}
+
+func clamp(v, min, max float64) float64 {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func parseKeyValueOutput(output string) map[string]string {
+	values := make(map[string]string)
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		values[key] = value
+	}
+	return values
+}
+
+func parseFloatOrZero(value string) float64 {
+	v, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+func parseIntOrZero(value string) int {
+	v, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+func truncateText(value string, maxLen int) string {
+	if len(value) <= maxLen {
+		return value
+	}
+	return value[:maxLen] + "\n...truncated..."
+}
+
+func collectSystemInfo(computer Computer) (SystemInfo, error) {
+	// Linux-focused script (Debian/Ubuntu compatible).
+	// Emits KEY=VALUE lines for predictable parsing.
+	script := `
+OS=$(awk -F= '/^PRETTY_NAME=/{gsub(/"/, "", $2); print $2}' /etc/os-release 2>/dev/null)
+if [ -z "$OS" ]; then OS=$(uname -s); fi
+
+MEM_TOTAL_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null)
+MEM_AVAIL_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null)
+if [ -z "$MEM_AVAIL_KB" ]; then MEM_AVAIL_KB=$(awk '/MemFree/ {print $2}' /proc/meminfo 2>/dev/null); fi
+if [ -z "$MEM_TOTAL_KB" ]; then MEM_TOTAL_KB=0; fi
+if [ -z "$MEM_AVAIL_KB" ]; then MEM_AVAIL_KB=0; fi
+MEM_USED_KB=$((MEM_TOTAL_KB - MEM_AVAIL_KB))
+if [ "$MEM_USED_KB" -lt 0 ]; then MEM_USED_KB=0; fi
+
+DISK_TOTAL_KB=$(df -kP / 2>/dev/null | awk 'NR==2 {print $2}')
+DISK_USED_KB=$(df -kP / 2>/dev/null | awk 'NR==2 {print $3}')
+DISK_USED_PCT=$(df -kP / 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $5}')
+if [ -z "$DISK_TOTAL_KB" ]; then DISK_TOTAL_KB=0; fi
+if [ -z "$DISK_USED_KB" ]; then DISK_USED_KB=0; fi
+if [ -z "$DISK_USED_PCT" ]; then DISK_USED_PCT=0; fi
+
+echo "OS=$OS"
+echo "MEM_TOTAL_KB=$MEM_TOTAL_KB"
+echo "MEM_USED_KB=$MEM_USED_KB"
+echo "DISK_TOTAL_KB=$DISK_TOTAL_KB"
+echo "DISK_USED_KB=$DISK_USED_KB"
+echo "DISK_USED_PCT=$DISK_USED_PCT"
+`
+
+	command := fmt.Sprintf("bash -lc %q", script)
+	output, err := executeSSHCommand(computer.IP, computer.Username, command)
+	if err != nil {
+		return SystemInfo{}, err
+	}
+
+	values := parseKeyValueOutput(output)
+	if len(values) == 0 {
+		return SystemInfo{}, errors.New("unable to parse system metrics from SSH output")
+	}
+
+	memoryTotalKB := parseFloatOrZero(values["MEM_TOTAL_KB"])
+	memoryUsedKB := parseFloatOrZero(values["MEM_USED_KB"])
+	diskTotalKB := parseFloatOrZero(values["DISK_TOTAL_KB"])
+	diskUsedKB := parseFloatOrZero(values["DISK_USED_KB"])
+	diskUsagePercent := parseFloatOrZero(values["DISK_USED_PCT"])
+
+	if memoryUsedKB > memoryTotalKB && memoryTotalKB > 0 {
+		memoryUsedKB = memoryTotalKB
+	}
+	if diskUsedKB > diskTotalKB && diskTotalKB > 0 {
+		diskUsedKB = diskTotalKB
+	}
+
+	memoryUsagePercent := 0.0
+	if memoryTotalKB > 0 {
+		memoryUsagePercent = (memoryUsedKB / memoryTotalKB) * 100
+	}
+	if diskUsagePercent == 0 && diskTotalKB > 0 {
+		diskUsagePercent = (diskUsedKB / diskTotalKB) * 100
+	}
+
+	const kbPerGB = 1024.0 * 1024.0
+	osName := values["OS"]
+	if osName == "" {
+		osName = "Unknown Linux"
+	}
+
+	return SystemInfo{
+		ComputerID:         computer.ID,
+		Place:              computer.Place,
+		Username:           computer.Username,
+		IP:                 computer.IP,
+		OS:                 osName,
+		MemoryTotalGB:      round2(memoryTotalKB / kbPerGB),
+		MemoryUsedGB:       round2(memoryUsedKB / kbPerGB),
+		MemoryUsagePercent: round2(memoryUsagePercent),
+		DiskTotalGB:        round2(diskTotalKB / kbPerGB),
+		DiskUsedGB:         round2(diskUsedKB / kbPerGB),
+		DiskUsagePercent:   round2(diskUsagePercent),
+		CollectedAt:        time.Now().Format("2006-01-02 15:04:05"),
+	}, nil
+}
+
+func collectCPUOverview(computer Computer) (CPUOverview, error) {
+	systemInfo, err := collectSystemInfo(computer)
+	if err != nil {
+		return CPUOverview{}, err
+	}
+
+	summaryScript := `
+CPU_MODEL=$(lscpu 2>/dev/null | awk -F: '/Model name/ {sub(/^[ \t]+/, "", $2); print $2; exit}')
+ARCH=$(lscpu 2>/dev/null | awk -F: '/Architecture/ {sub(/^[ \t]+/, "", $2); print $2; exit}')
+THREADS_PER_CORE=$(lscpu 2>/dev/null | awk -F: '/Thread\(s\) per core/ {sub(/^[ \t]+/, "", $2); print $2; exit}')
+SOCKETS=$(lscpu 2>/dev/null | awk -F: '/Socket\(s\)/ {sub(/^[ \t]+/, "", $2); print $2; exit}')
+CORES=$(nproc --all 2>/dev/null)
+if [ -z "$CORES" ]; then CORES=$(lscpu 2>/dev/null | awk -F: '/^CPU\(s\):/ {sub(/^[ \t]+/, "", $2); print $2; exit}'); fi
+
+LOAD1=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
+LOAD5=$(awk '{print $2}' /proc/loadavg 2>/dev/null)
+LOAD15=$(awk '{print $3}' /proc/loadavg 2>/dev/null)
+
+KERNEL=$(uname -r 2>/dev/null)
+UPTIME=$(uptime -p 2>/dev/null)
+if [ -z "$UPTIME" ]; then UPTIME=$(uptime 2>/dev/null); fi
+
+echo "CPU_MODEL=$CPU_MODEL"
+echo "ARCH=$ARCH"
+echo "THREADS_PER_CORE=${THREADS_PER_CORE:-0}"
+echo "SOCKETS=${SOCKETS:-0}"
+echo "CORES=${CORES:-0}"
+echo "LOAD1=${LOAD1:-0}"
+echo "LOAD5=${LOAD5:-0}"
+echo "LOAD15=${LOAD15:-0}"
+echo "KERNEL=$KERNEL"
+echo "UPTIME=$UPTIME"
+`
+
+	summaryCommand := fmt.Sprintf("bash -lc %q", summaryScript)
+	summaryOut, err := executeSSHCommand(computer.IP, computer.Username, summaryCommand)
+	if err != nil {
+		return CPUOverview{}, err
+	}
+
+	summary := parseKeyValueOutput(summaryOut)
+	if len(summary) == 0 {
+		return CPUOverview{}, errors.New("unable to parse cpu overview metrics from SSH output")
+	}
+
+	coreCount := parseIntOrZero(summary["CORES"])
+	if coreCount <= 0 {
+		coreCount = 1
+	}
+
+	load1 := parseFloatOrZero(summary["LOAD1"])
+	load5 := parseFloatOrZero(summary["LOAD5"])
+	load15 := parseFloatOrZero(summary["LOAD15"])
+	cpuUsagePercent := 0.0
+	if coreCount > 0 {
+		cpuUsagePercent = (load1 / float64(coreCount)) * 100
+	}
+	cpuUsagePercent = clamp(cpuUsagePercent, 0, 100)
+
+	freeOut, _ := executeSSHCommand(computer.IP, computer.Username, "free -h 2>&1")
+	lscpuOut, _ := executeSSHCommand(computer.IP, computer.Username, "lscpu 2>&1")
+	dmesgOut, _ := executeSSHCommand(computer.IP, computer.Username, "dmesg 2>&1 | tail -n 25")
+
+	if strings.TrimSpace(freeOut) == "" {
+		freeOut = "No output from free -h"
+	}
+	if strings.TrimSpace(lscpuOut) == "" {
+		lscpuOut = "No output from lscpu"
+	}
+	if strings.TrimSpace(dmesgOut) == "" {
+		dmesgOut = "No output from dmesg"
+	}
+
+	return CPUOverview{
+		ComputerID:         computer.ID,
+		Place:              computer.Place,
+		Username:           computer.Username,
+		IP:                 computer.IP,
+		OS:                 systemInfo.OS,
+		Kernel:             summary["KERNEL"],
+		Uptime:             summary["UPTIME"],
+		Architecture:       summary["ARCH"],
+		CPUModel:           summary["CPU_MODEL"],
+		CoreCount:          coreCount,
+		ThreadsPerCore:     parseIntOrZero(summary["THREADS_PER_CORE"]),
+		SocketCount:        parseIntOrZero(summary["SOCKETS"]),
+		Load1:              round2(load1),
+		Load5:              round2(load5),
+		Load15:             round2(load15),
+		CPUUsagePercent:    round2(cpuUsagePercent),
+		MemoryTotalGB:      systemInfo.MemoryTotalGB,
+		MemoryUsedGB:       systemInfo.MemoryUsedGB,
+		MemoryUsagePercent: systemInfo.MemoryUsagePercent,
+		DiskTotalGB:        systemInfo.DiskTotalGB,
+		DiskUsedGB:         systemInfo.DiskUsedGB,
+		DiskUsagePercent:   systemInfo.DiskUsagePercent,
+		Commands: CPUCommandOutput{
+			Free:  truncateText(freeOut, 6000),
+			LSCPU: truncateText(lscpuOut, 6000),
+			Dmesg: truncateText(dmesgOut, 6000),
+		},
+		CollectedAt: systemInfo.CollectedAt,
+	}, nil
+}
+
 // getSSHConfig loads SSH private key(s) from disk (no SSH agent)
 func getSSHConfig(username string) ([]ssh.AuthMethod, error) {
 	var authMethods []ssh.AuthMethod
@@ -383,26 +680,33 @@ func getSSHConfig(username string) ([]ssh.AuthMethod, error) {
 
 	// IMPORTANT: do NOT use SSH_AUTH_SOCK / ssh-agent here.
 	// We rely only on private key files from disk.
+	homeCandidates := map[string]struct{}{}
 
-	usr, err := user.Current()
-	if err != nil {
-		log.Printf("WARNING: Failed to get current user: %v", err)
-	} else {
-		keyPaths := []string{
-			filepath.Join(usr.HomeDir, ".ssh", "id_rsa"),
-			filepath.Join(usr.HomeDir, ".ssh", "id_ed25519"),
-			filepath.Join(usr.HomeDir, ".ssh", "id_ecdsa"),
-		}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		homeCandidates[home] = struct{}{}
+	}
+	if usr, err := user.Current(); err == nil && usr.HomeDir != "" {
+		homeCandidates[usr.HomeDir] = struct{}{}
+	}
+	if homeEnv := os.Getenv("HOME"); homeEnv != "" {
+		homeCandidates[homeEnv] = struct{}{}
+	}
 
-		// Also try explicit paths for your user/root
-		keyPaths = append(keyPaths,
-			"/root/.ssh/id_rsa",
-			"/root/.ssh/id_ed25519",
-			"/home/sysadmin007/.ssh/id_rsa",
-			"/home/sysadmin007/.ssh/id_ed25519",
-		)
+	// Keep explicit fallbacks for common service user setups.
+	homeCandidates["/home/sysadmin007"] = struct{}{}
+	homeCandidates["/root"] = struct{}{}
 
-		for _, keyPath := range keyPaths {
+	keyNames := []string{"id_ed25519", "id_rsa", "id_ecdsa"}
+	seenPath := map[string]struct{}{}
+
+	for home := range homeCandidates {
+		for _, keyName := range keyNames {
+			keyPath := filepath.Join(home, ".ssh", keyName)
+			if _, seen := seenPath[keyPath]; seen {
+				continue
+			}
+			seenPath[keyPath] = struct{}{}
+
 			key, err := os.ReadFile(keyPath)
 			if err != nil {
 				continue
@@ -420,37 +724,7 @@ func getSSHConfig(username string) ([]ssh.AuthMethod, error) {
 	}
 
 	if len(authMethods) == 0 {
-		return nil, errors.New("no SSH keys found - ensure SSH keys are in ~/.ssh/")
-	}
-
-	return authMethods, nil
-}
-
-	// Also support SSH key files in PEM format
-	pemPath := filepath.Join(os.Getenv("HOME"), ".ssh")
-	if entries, err := os.ReadDir(pemPath); err == nil {
-		for _, entry := range entries {
-			if !entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
-				fullPath := filepath.Join(pemPath, entry.Name())
-				key, err := os.ReadFile(fullPath)
-				if err != nil {
-					continue
-				}
-
-				block, _ := pem.Decode(key)
-				if block != nil && (strings.Contains(block.Type, "RSA") || strings.Contains(block.Type, "PRIVATE")) {
-					signer, err := ssh.ParsePrivateKey(key)
-					if err == nil {
-						authMethods = append(authMethods, ssh.PublicKeys(signer))
-						log.Printf("INFO: Loaded SSH key from %s", fullPath)
-					}
-				}
-			}
-		}
-	}
-
-	if len(authMethods) == 0 {
-		return nil, errors.New("no SSH keys found - ensure SSH keys are in ~/.ssh/")
+		return nil, errors.New("no usable SSH private keys found in ~/.ssh (id_ed25519/id_rsa/id_ecdsa)")
 	}
 
 	return authMethods, nil
@@ -572,6 +846,131 @@ func executeTerminal(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 	log.Printf("INFO: Terminal command executed on %s@%s (%s) - Command: %s", computer.Username, computer.Place, computer.IP, req.Command)
+}
+
+// getComputerSystemInfo handles GET /api/system-info/:id
+// Collects host metrics via SSH and persists OS changes to DB.
+func getComputerSystemInfo(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+
+	id := strings.TrimPrefix(r.URL.Path, "/api/system-info/")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "Missing computer ID",
+		})
+		return
+	}
+
+	computers, err := getComputers()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   "Failed to retrieve computers",
+		})
+		return
+	}
+
+	var computer *Computer
+	for i := range computers {
+		if computers[i].ID == id {
+			computer = &computers[i]
+			break
+		}
+	}
+
+	if computer == nil {
+		writeJSON(w, http.StatusNotFound, APIResponse{
+			Success: false,
+			Error:   "Computer not found",
+		})
+		return
+	}
+
+	info, err := collectSystemInfo(*computer)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to collect system info via SSH: %v", err),
+		})
+		log.Printf("ERROR: Failed to collect system info for %s@%s (%s): %v", computer.Username, computer.Place, computer.IP, err)
+		return
+	}
+
+	// Persist OS version changes; future card refreshes show latest OS.
+	if info.OS != "" && info.OS != computer.OS {
+		if err := updateComputerOS(computer.ID, info.OS); err != nil {
+			log.Printf("WARNING: Failed to persist OS update for ID %s: %v", computer.ID, err)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data:    info,
+	})
+	log.Printf("INFO: System info collected for %s@%s (%s): OS=%s", computer.Username, computer.Place, computer.IP, info.OS)
+}
+
+// getCPUOverview handles GET /api/cpu-overview/:id
+// Runs basic Linux commands and returns parsed CPU overview + raw command output.
+func getCPUOverview(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+
+	id := strings.TrimPrefix(r.URL.Path, "/api/cpu-overview/")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "Missing computer ID",
+		})
+		return
+	}
+
+	computers, err := getComputers()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   "Failed to retrieve computers",
+		})
+		return
+	}
+
+	var computer *Computer
+	for i := range computers {
+		if computers[i].ID == id {
+			computer = &computers[i]
+			break
+		}
+	}
+
+	if computer == nil {
+		writeJSON(w, http.StatusNotFound, APIResponse{
+			Success: false,
+			Error:   "Computer not found",
+		})
+		return
+	}
+
+	overview, err := collectCPUOverview(*computer)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to collect CPU overview via SSH: %v", err),
+		})
+		log.Printf("ERROR: Failed to collect CPU overview for %s@%s (%s): %v", computer.Username, computer.Place, computer.IP, err)
+		return
+	}
+
+	if overview.OS != "" && overview.OS != computer.OS {
+		if err := updateComputerOS(computer.ID, overview.OS); err != nil {
+			log.Printf("WARNING: Failed to persist OS update for ID %s: %v", computer.ID, err)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data:    overview,
+	})
+	log.Printf("INFO: CPU overview collected for %s@%s (%s)", computer.Username, computer.Place, computer.IP)
 }
 
 // ============================================================================
@@ -791,6 +1190,10 @@ func router(w http.ResponseWriter, r *http.Request) {
 		pingOne(w, r)
 	case path == "/api/ping-all" && r.Method == http.MethodGet:
 		pingAll(w, r)
+	case strings.HasPrefix(path, "/api/system-info/") && r.Method == http.MethodGet:
+		getComputerSystemInfo(w, r)
+	case strings.HasPrefix(path, "/api/cpu-overview/") && r.Method == http.MethodGet:
+		getCPUOverview(w, r)
 	case path == "/api/terminal/execute" && r.Method == http.MethodPost:
 		executeTerminal(w, r)
 	case path == "/api/terminal/ws" && r.Method == http.MethodGet:

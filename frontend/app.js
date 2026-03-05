@@ -78,6 +78,205 @@ async function pingAll() {
 }
 
 /**
+ * Runs one command via /api/terminal/execute and returns command output.
+ * @param {string} computerId - Computer ID
+ * @param {string} command - Linux command
+ * @returns {Promise<string>} command output text
+ */
+async function runTerminalCommand(computerId, command) {
+  const response = await fetch(`${API_BASE_URL}/terminal/execute`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ computerId, command }),
+  });
+
+  const raw = await response.text();
+  let json;
+  try {
+    json = JSON.parse(raw);
+  } catch (parseError) {
+    throw new Error("Terminal API did not return JSON.");
+  }
+
+  if (!json.success) {
+    throw new Error(json.error || "Terminal command failed.");
+  }
+
+  return (json.data && json.data.output) || "";
+}
+
+function parseKeyValueLines(text) {
+  const map = {};
+  String(text || "")
+    .split(/\r?\n/)
+    .forEach((line) => {
+      const parts = line.split("=");
+      if (parts.length < 2) return;
+      const key = parts.shift().trim();
+      const value = parts.join("=").trim();
+      if (!key) return;
+      map[key] = value;
+    });
+  return map;
+}
+
+function toNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function truncateText(value, maxLen = 6000) {
+  const str = String(value || "");
+  if (str.length <= maxLen) return str;
+  return `${str.slice(0, maxLen)}\n...truncated...`;
+}
+
+async function loadSystemInfoFallbackViaTerminal(computer) {
+  const summaryScript = `
+OS=$(awk -F= '/^PRETTY_NAME=/{gsub(/"/, "", $2); print $2}' /etc/os-release 2>/dev/null)
+if [ -z "$OS" ]; then OS=$(uname -s); fi
+CPU_MODEL=$(lscpu 2>/dev/null | awk -F: '/Model name/ {sub(/^[ \t]+/, "", $2); print $2; exit}')
+ARCH=$(lscpu 2>/dev/null | awk -F: '/Architecture/ {sub(/^[ \t]+/, "", $2); print $2; exit}')
+THREADS_PER_CORE=$(lscpu 2>/dev/null | awk -F: '/Thread\\(s\\) per core/ {sub(/^[ \t]+/, "", $2); print $2; exit}')
+SOCKETS=$(lscpu 2>/dev/null | awk -F: '/Socket\\(s\\)/ {sub(/^[ \t]+/, "", $2); print $2; exit}')
+CORES=$(nproc --all 2>/dev/null)
+if [ -z "$CORES" ]; then CORES=$(lscpu 2>/dev/null | awk -F: '/^CPU\\(s\\):/ {sub(/^[ \t]+/, "", $2); print $2; exit}'); fi
+LOAD1=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
+LOAD5=$(awk '{print $2}' /proc/loadavg 2>/dev/null)
+LOAD15=$(awk '{print $3}' /proc/loadavg 2>/dev/null)
+MEM_TOTAL_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null)
+MEM_AVAIL_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null)
+if [ -z "$MEM_AVAIL_KB" ]; then MEM_AVAIL_KB=$(awk '/MemFree/ {print $2}' /proc/meminfo 2>/dev/null); fi
+if [ -z "$MEM_TOTAL_KB" ]; then MEM_TOTAL_KB=0; fi
+if [ -z "$MEM_AVAIL_KB" ]; then MEM_AVAIL_KB=0; fi
+MEM_USED_KB=$((MEM_TOTAL_KB - MEM_AVAIL_KB))
+if [ "$MEM_USED_KB" -lt 0 ]; then MEM_USED_KB=0; fi
+DISK_TOTAL_KB=$(df -kP / 2>/dev/null | awk 'NR==2 {print $2}')
+DISK_USED_KB=$(df -kP / 2>/dev/null | awk 'NR==2 {print $3}')
+DISK_USED_PCT=$(df -kP / 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $5}')
+KERNEL=$(uname -r 2>/dev/null)
+UPTIME=$(uptime -p 2>/dev/null)
+if [ -z "$UPTIME" ]; then UPTIME=$(uptime 2>/dev/null); fi
+[ -z "$THREADS_PER_CORE" ] && THREADS_PER_CORE=0
+[ -z "$SOCKETS" ] && SOCKETS=0
+[ -z "$CORES" ] && CORES=0
+[ -z "$LOAD1" ] && LOAD1=0
+[ -z "$LOAD5" ] && LOAD5=0
+[ -z "$LOAD15" ] && LOAD15=0
+[ -z "$MEM_TOTAL_KB" ] && MEM_TOTAL_KB=0
+[ -z "$MEM_USED_KB" ] && MEM_USED_KB=0
+[ -z "$DISK_TOTAL_KB" ] && DISK_TOTAL_KB=0
+[ -z "$DISK_USED_KB" ] && DISK_USED_KB=0
+[ -z "$DISK_USED_PCT" ] && DISK_USED_PCT=0
+echo "OS=$OS"
+echo "CPU_MODEL=$CPU_MODEL"
+echo "ARCH=$ARCH"
+echo "THREADS_PER_CORE=$THREADS_PER_CORE"
+echo "SOCKETS=$SOCKETS"
+echo "CORES=$CORES"
+echo "LOAD1=$LOAD1"
+echo "LOAD5=$LOAD5"
+echo "LOAD15=$LOAD15"
+echo "MEM_TOTAL_KB=$MEM_TOTAL_KB"
+echo "MEM_USED_KB=$MEM_USED_KB"
+echo "DISK_TOTAL_KB=$DISK_TOTAL_KB"
+echo "DISK_USED_KB=$DISK_USED_KB"
+echo "DISK_USED_PCT=$DISK_USED_PCT"
+echo "KERNEL=$KERNEL"
+echo "UPTIME=$UPTIME"
+`;
+
+  const [summaryRaw, lscpuRaw, freeRaw, dmesgRaw] = await Promise.all([
+    runTerminalCommand(computer.id, `bash -lc ${JSON.stringify(summaryScript)}`),
+    runTerminalCommand(computer.id, "lscpu 2>&1"),
+    runTerminalCommand(computer.id, "free -h 2>&1"),
+    runTerminalCommand(computer.id, "dmesg 2>&1 | tail -n 25"),
+  ]);
+
+  const values = parseKeyValueLines(summaryRaw);
+  const kbPerGB = 1024 * 1024;
+
+  const coreCount = Math.max(1, Math.trunc(toNumber(values.CORES)));
+  const load1 = toNumber(values.LOAD1);
+  const load5 = toNumber(values.LOAD5);
+  const load15 = toNumber(values.LOAD15);
+  const cpuUsagePercent = clampPercent((load1 / coreCount) * 100);
+
+  const memoryTotalKB = toNumber(values.MEM_TOTAL_KB);
+  const memoryUsedKB = Math.min(memoryTotalKB, Math.max(0, toNumber(values.MEM_USED_KB)));
+  const memoryUsagePercent = memoryTotalKB > 0 ? (memoryUsedKB / memoryTotalKB) * 100 : 0;
+
+  const diskTotalKB = toNumber(values.DISK_TOTAL_KB);
+  const diskUsedKB = Math.min(diskTotalKB, Math.max(0, toNumber(values.DISK_USED_KB)));
+  const diskUsagePercent = toNumber(values.DISK_USED_PCT) || (diskTotalKB > 0 ? (diskUsedKB / diskTotalKB) * 100 : 0);
+
+  return {
+    computerId: computer.id,
+    place: computer.place,
+    username: computer.username,
+    ip: computer.ip,
+    os: values.OS || computer.os || "Unknown Linux",
+    kernel: values.KERNEL || "",
+    uptime: values.UPTIME || "",
+    architecture: values.ARCH || "",
+    cpuModel: values.CPU_MODEL || "",
+    coreCount,
+    threadsPerCore: Math.max(0, Math.trunc(toNumber(values.THREADS_PER_CORE))),
+    socketCount: Math.max(0, Math.trunc(toNumber(values.SOCKETS))),
+    load1: roundTo(load1, 2),
+    load5: roundTo(load5, 2),
+    load15: roundTo(load15, 2),
+    cpuUsagePercent: roundTo(cpuUsagePercent, 2),
+    memoryTotalGB: roundTo(memoryTotalKB / kbPerGB, 2),
+    memoryUsedGB: roundTo(memoryUsedKB / kbPerGB, 2),
+    memoryUsagePercent: roundTo(memoryUsagePercent, 2),
+    diskTotalGB: roundTo(diskTotalKB / kbPerGB, 2),
+    diskUsedGB: roundTo(diskUsedKB / kbPerGB, 2),
+    diskUsagePercent: roundTo(diskUsagePercent, 2),
+    commands: {
+      lscpu: truncateText(lscpuRaw),
+      free: truncateText(freeRaw),
+      dmesg: truncateText(dmesgRaw),
+    },
+    collectedAt: new Date().toLocaleString(),
+  };
+}
+
+function roundTo(value, digits) {
+  const factor = 10 ** digits;
+  return Math.round((Number(value) || 0) * factor) / factor;
+}
+
+/**
+ * Loads CPU overview + memory/storage/OS info for one computer via SSH.
+ * @param {Object} computer - Computer object
+ * @returns {Promise<Object>} CPU overview payload
+ */
+async function loadSystemInfo(computer) {
+  try {
+    const response = await fetch(`${API_BASE_URL}/cpu-overview/${computer.id}`);
+    const raw = await response.text();
+    let json;
+    try {
+      json = JSON.parse(raw);
+    } catch (parseError) {
+      // Old backend or HTML fallback: use terminal API fallback.
+      return await loadSystemInfoFallbackViaTerminal(computer);
+    }
+    if (!json.success) throw new Error(json.error);
+    return json.data;
+  } catch (error) {
+    // If new endpoint is missing/invalid, fallback to terminal command strategy.
+    try {
+      return await loadSystemInfoFallbackViaTerminal(computer);
+    } catch (fallbackError) {
+      console.error(`Failed to load system info for ${computer.id}:`, error, fallbackError);
+      throw fallbackError;
+    }
+  }
+}
+
+/**
  * Runs a single SSH command on all computers via the HTTP terminal API.
  * This is a one-shot, non-interactive broadcast — similar to "Check All".
  */
@@ -224,6 +423,7 @@ function renderCard(computer, statusData = null) {
   // Determine status information
   const status = statusData ? statusData.status : null;
   const checkedAt = statusData ? statusData.checkedAt : null;
+  const osText = computer.os && computer.os.trim() ? computer.os : "Unknown OS";
   
   // Apply appropriate styling based on status
   const statusClass = status === "ON" ? "card--on" : status === "OFF" ? "card--off" : "card--idle";
@@ -237,6 +437,7 @@ function renderCard(computer, statusData = null) {
       <h2 class="card__name">${escapeHTML(computer.place)}</h2>
       <p class="card__username">@${escapeHTML(computer.username)}</p>
       <p class="card__ip">${escapeHTML(computer.ip)}</p>
+      <p class="card__os">${escapeHTML(osText)}</p>
     </div>
     <div class="card__status">
       <span class="card__badge">${badgeText}</span>
@@ -244,6 +445,12 @@ function renderCard(computer, statusData = null) {
     <div class="card__footer">
       <span class="card__time">${timeText}</span>
       <div class="card__buttons">
+        <button class="btn-insights" data-id="${computer.id}" title="CPU overview (lscpu, free -h, dmesg)">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" aria-hidden="true" focusable="false">
+            <path d="M3 3v18h18"/>
+            <path d="M7 15l3-3 3 2 4-6"/>
+          </svg>
+        </button>
         <button class="btn-terminal" data-id="${computer.id}" title="Open SSH terminal">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" aria-hidden="true" focusable="false">
             <rect x="3" y="4" width="18" height="14" rx="2" ry="2"/>
@@ -289,6 +496,9 @@ function renderCard(computer, statusData = null) {
 
   // Attach event listeners to buttons
   document
+    .querySelector(`#card-${computer.id} .btn-insights`)
+    .addEventListener("click", () => handleOpenSystemInfo(computer.id));
+  document
     .querySelector(`#card-${computer.id} .btn-terminal`)
     .addEventListener("click", () => openTerminalModal(computer));
   document
@@ -318,6 +528,25 @@ function setCardLoading(id, loading) {
         <circle cx="12" cy="12" r="10"/>
         <polyline points="12 6 12 12 16 14"/>
       </svg> Check`;
+}
+
+function setSystemInfoButtonLoading(id, loading) {
+  const button = document.querySelector(`#card-${id} .btn-insights`);
+  if (!button) return;
+
+  button.disabled = loading;
+  button.innerHTML = loading
+    ? `<span class="spinner"></span>`
+    : `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" aria-hidden="true" focusable="false">
+        <path d="M3 3v18h18"/>
+        <path d="M7 15l3-3 3 2 4-6"/>
+      </svg>`;
+}
+
+function updateCardOSLabel(id, osName) {
+  const el = document.querySelector(`#card-${id} .card__os`);
+  if (!el) return;
+  el.textContent = osName && osName.trim() ? osName : "Unknown OS";
 }
 
 /**
@@ -449,7 +678,8 @@ async function handleEditComputer(event) {
     await updateComputer(id, { id, place, username, ip });
     const computerIndex = computers.findIndex((c) => c.id === id);
     if (computerIndex > -1) {
-      computers[computerIndex] = { id, place, username, ip };
+      const existingOS = computers[computerIndex].os || "";
+      computers[computerIndex] = { id, place, username, ip, os: existingOS };
       renderCard(computers[computerIndex]);
     }
 
@@ -484,6 +714,130 @@ async function handleDeleteComputer(id) {
   }
 }
 
+function formatGB(value) {
+  return `${Number(value || 0).toFixed(2)} GB`;
+}
+
+function clampPercent(value) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num)) return 0;
+  return Math.max(0, Math.min(100, num));
+}
+
+function setUsageBar(barId, percent) {
+  const bar = document.getElementById(barId);
+  if (!bar) return;
+  const safePercent = clampPercent(percent);
+  bar.style.width = `${safePercent}%`;
+}
+
+function setSystemInfoMessage(text, isError = false) {
+  const messageEl = document.getElementById("system-info-message");
+  if (!messageEl) return;
+  messageEl.textContent = text || "";
+  messageEl.classList.toggle("system-info-page__message--error", isError);
+}
+
+function renderSystemInfoLoading(computer) {
+  document.getElementById("system-info-title").textContent = `CPU Overview - ${computer.place}`;
+  document.getElementById("system-info-subtitle").textContent = `${computer.username}@${computer.ip}`;
+  document.getElementById("system-info-os").textContent = computer.os || "Detecting...";
+  document.getElementById("system-info-cpu-model").textContent = "Detecting...";
+  document.getElementById("system-info-cpu-arch").textContent = "Detecting...";
+  document.getElementById("system-info-updated").textContent = "Fetching latest data...";
+  document.getElementById("system-cpu-percent").textContent = "--%";
+  document.getElementById("system-memory-percent").textContent = "--%";
+  document.getElementById("system-disk-percent").textContent = "--%";
+  document.getElementById("system-cpu-text").textContent = "--";
+  document.getElementById("system-memory-text").textContent = "-- / --";
+  document.getElementById("system-disk-text").textContent = "-- / --";
+  document.getElementById("system-cmd-lscpu").textContent = "Running: lscpu ...";
+  document.getElementById("system-cmd-free").textContent = "Running: free -h ...";
+  document.getElementById("system-cmd-dmesg").textContent = "Running: dmesg ...";
+  setUsageBar("system-cpu-bar", 0);
+  setUsageBar("system-memory-bar", 0);
+  setUsageBar("system-disk-bar", 0);
+  setSystemInfoMessage("Running SSH checks for CPU, RAM, storage, and OS...");
+}
+
+function renderSystemInfoData(info) {
+  document.getElementById("system-info-title").textContent = `CPU Overview - ${info.place}`;
+  document.getElementById("system-info-subtitle").textContent = `${info.username}@${info.ip}`;
+  document.getElementById("system-info-os").textContent = info.os || "Unknown OS";
+  document.getElementById("system-info-cpu-model").textContent = info.cpuModel || "Unknown CPU";
+  const coreText = `${info.coreCount || 0} cores • ${info.threadsPerCore || 0} threads/core • ${info.architecture || "Unknown arch"}`;
+  document.getElementById("system-info-cpu-arch").textContent = coreText;
+  document.getElementById("system-info-updated").textContent = info.collectedAt || "-";
+
+  const cpuPercent = clampPercent(info.cpuUsagePercent);
+  const memoryPercent = clampPercent(info.memoryUsagePercent);
+  const diskPercent = clampPercent(info.diskUsagePercent);
+
+  document.getElementById("system-cpu-percent").textContent = `${cpuPercent.toFixed(1)}%`;
+  document.getElementById("system-memory-percent").textContent = `${memoryPercent.toFixed(1)}%`;
+  document.getElementById("system-disk-percent").textContent = `${diskPercent.toFixed(1)}%`;
+  document.getElementById("system-cpu-text").textContent =
+    `Load: ${Number(info.load1 || 0).toFixed(2)} / ${Number(info.load5 || 0).toFixed(2)} / ${Number(info.load15 || 0).toFixed(2)}  |  Uptime: ${info.uptime || "-"}`;
+  document.getElementById("system-memory-text").textContent =
+    `${formatGB(info.memoryUsedGB)} used of ${formatGB(info.memoryTotalGB)}`;
+  document.getElementById("system-disk-text").textContent =
+    `${formatGB(info.diskUsedGB)} used of ${formatGB(info.diskTotalGB)}`;
+  document.getElementById("system-cmd-lscpu").textContent = (info.commands && info.commands.lscpu) || "No lscpu output";
+  document.getElementById("system-cmd-free").textContent = (info.commands && info.commands.free) || "No free -h output";
+  document.getElementById("system-cmd-dmesg").textContent = (info.commands && info.commands.dmesg) || "No dmesg output";
+
+  setUsageBar("system-cpu-bar", cpuPercent);
+  setUsageBar("system-memory-bar", memoryPercent);
+  setUsageBar("system-disk-bar", diskPercent);
+  setSystemInfoMessage("");
+}
+
+function renderSystemInfoError(errorMessage) {
+  setSystemInfoMessage(errorMessage || "Failed to load system info.", true);
+}
+
+function openSystemInfoPage(computer) {
+  const page = document.getElementById("system-info-page");
+  page.classList.add("active");
+  document.body.style.overflow = "hidden";
+  renderSystemInfoLoading(computer);
+}
+
+function closeSystemInfoPage() {
+  const page = document.getElementById("system-info-page");
+  page.classList.remove("active");
+  if (!document.getElementById("terminal-modal").classList.contains("active")) {
+    document.body.style.overflow = "auto";
+  }
+}
+
+async function handleOpenSystemInfo(id) {
+  const computer = computers.find((c) => c.id === id);
+  if (!computer) {
+    showToast("Computer not found.", "error");
+    return;
+  }
+
+  openSystemInfoPage(computer);
+  setSystemInfoButtonLoading(id, true);
+
+  try {
+    const info = await loadSystemInfo(computer);
+    renderSystemInfoData(info);
+
+    const target = computers.find((c) => c.id === id);
+    if (target) {
+      target.os = info.os || "";
+      updateCardOSLabel(id, target.os);
+    }
+  } catch (error) {
+    renderSystemInfoError(error.message);
+    showToast(`System info error: ${error.message}`, "error");
+  } finally {
+    setSystemInfoButtonLoading(id, false);
+  }
+}
+
 // ============================================================================
 // Terminal Management
 // ============================================================================
@@ -492,6 +846,81 @@ let currentTerminalComputer = null;
 let terminalSocket = null;
 let terminalInstance = null;
 let terminalFallbackMode = false; // true = plain text div instead of xterm
+const terminalCommandHistory = [];
+const terminalHistoryLimit = 100;
+let terminalHistoryIndex = -1; // -1 means not currently browsing history
+let terminalHistoryDraft = "";
+
+// Strip ANSI/control escape sequences when xterm.js is unavailable.
+function stripAnsiControlCodes(text) {
+  return text
+    // OSC sequences (window title, etc.)
+    .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, "")
+    // CSI sequences (colors, cursor movement, bracketed paste mode)
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
+    // Single-character escape sequences
+    .replace(/\x1B[@-Z\\-_]/g, "")
+    // Bell
+    .replace(/\x07/g, "")
+    // Carriage returns create noisy artifacts in plain div mode
+    .replace(/\r/g, "");
+}
+
+function normalizeTerminalChunks(rawText) {
+  return stripAnsiControlCodes(rawText)
+    .split(/\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line);
+}
+
+function setInputCaretToEnd(inputEl) {
+  const len = inputEl.value.length;
+  inputEl.setSelectionRange(len, len);
+}
+
+function rememberTerminalCommand(command) {
+  if (!command) return;
+
+  if (terminalCommandHistory.length === 0 || terminalCommandHistory[terminalCommandHistory.length - 1] !== command) {
+    terminalCommandHistory.push(command);
+    if (terminalCommandHistory.length > terminalHistoryLimit) {
+      terminalCommandHistory.shift();
+    }
+  }
+
+  terminalHistoryIndex = -1;
+  terminalHistoryDraft = "";
+}
+
+function navigateTerminalHistory(direction) {
+  const inputEl = document.getElementById("terminal-input");
+  if (!inputEl || terminalCommandHistory.length === 0) return;
+
+  if (direction < 0) {
+    if (terminalHistoryIndex === -1) {
+      terminalHistoryDraft = inputEl.value;
+      terminalHistoryIndex = terminalCommandHistory.length - 1;
+    } else if (terminalHistoryIndex > 0) {
+      terminalHistoryIndex -= 1;
+    }
+
+    inputEl.value = terminalCommandHistory[terminalHistoryIndex];
+    setInputCaretToEnd(inputEl);
+    return;
+  }
+
+  if (terminalHistoryIndex === -1) return;
+
+  if (terminalHistoryIndex < terminalCommandHistory.length - 1) {
+    terminalHistoryIndex += 1;
+    inputEl.value = terminalCommandHistory[terminalHistoryIndex];
+  } else {
+    terminalHistoryIndex = -1;
+    inputEl.value = terminalHistoryDraft;
+  }
+
+  setInputCaretToEnd(inputEl);
+}
 
 /**
  * Sends a single command from the bottom input box into the SSH terminal.
@@ -504,6 +933,8 @@ function sendTerminalCommandFromInput() {
   const raw = inputEl.value;
   const command = raw.trimEnd();
   if (!command) return;
+
+  rememberTerminalCommand(command);
 
   // Echo the command into the terminal for clarity
   if (terminalInstance) {
@@ -573,17 +1004,12 @@ function initPlainTerminal(computer, container) {
   };
 
   terminalSocket.onmessage = (event) => {
-    if (typeof event.data === "string") {
-      // Backend sends \r\n – normalize to \n for the div
-      event.data.split(/\r?\n/).forEach((chunk) => {
-        if (chunk) appendLine(chunk);
-      });
-    } else {
-      const text = new TextDecoder().decode(event.data);
-      text.split(/\r?\n/).forEach((chunk) => {
-        if (chunk) appendLine(chunk);
-      });
-    }
+    const rawText =
+      typeof event.data === "string"
+        ? event.data
+        : new TextDecoder().decode(event.data);
+
+    normalizeTerminalChunks(rawText).forEach((chunk) => appendLine(chunk));
   };
 
   terminalSocket.onerror = () => {
@@ -692,7 +1118,9 @@ function initXterm(computer, container) {
  */
 function closeTerminalModal() {
   document.getElementById("terminal-modal").classList.remove("active");
-  document.body.style.overflow = "auto";
+  if (!document.getElementById("system-info-page").classList.contains("active")) {
+    document.body.style.overflow = "auto";
+  }
 
   if (window._termResizeHandler) {
     window.removeEventListener("resize", window._termResizeHandler);
@@ -816,6 +1244,12 @@ function setupEventListeners() {
     if (e.target.id === "terminal-modal") closeTerminalModal();
   });
 
+  // System info full-page listeners
+  document.getElementById("system-info-close").addEventListener("click", closeSystemInfoPage);
+  document.getElementById("system-info-page").addEventListener("click", (e) => {
+    if (e.target.id === "system-info-page") closeSystemInfoPage();
+  });
+
   // Terminal command input (bottom bar)
   const terminalInput = document.getElementById("terminal-input");
   const terminalSendBtn = document.getElementById("terminal-send-btn");
@@ -825,6 +1259,24 @@ function setupEventListeners() {
       if (e.key === "Enter") {
         e.preventDefault();
         sendTerminalCommandFromInput();
+        return;
+      }
+
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        navigateTerminalHistory(-1);
+        return;
+      }
+
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        navigateTerminalHistory(1);
+      }
+    });
+
+    terminalInput.addEventListener("input", () => {
+      if (terminalHistoryIndex === -1) {
+        terminalHistoryDraft = terminalInput.value;
       }
     });
   }
@@ -838,8 +1290,14 @@ function setupEventListeners() {
 
   // Global Escape key to close terminal
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && document.getElementById("terminal-modal").classList.contains("active")) {
-      closeTerminalModal();
+    if (e.key === "Escape") {
+      if (document.getElementById("terminal-modal").classList.contains("active")) {
+        closeTerminalModal();
+        return;
+      }
+      if (document.getElementById("system-info-page").classList.contains("active")) {
+        closeSystemInfoPage();
+      }
     }
   });
 }

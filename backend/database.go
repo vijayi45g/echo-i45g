@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"log"
+	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -47,6 +48,7 @@ func createTables() error {
 		place TEXT NOT NULL,
 		username TEXT NOT NULL DEFAULT 'root',
 		ip TEXT NOT NULL UNIQUE,
+		os_name TEXT NOT NULL DEFAULT '',
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	`
@@ -58,6 +60,15 @@ func createTables() error {
 	}
 
 	log.Println("INFO: Database tables initialized")
+
+	// Schema migration for existing databases created before os_name existed.
+	if _, err := db.Exec("ALTER TABLE computers ADD COLUMN os_name TEXT NOT NULL DEFAULT ''"); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			log.Printf("ERROR: Failed to add os_name column: %v", err)
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -67,7 +78,7 @@ func createTables() error {
 
 // getComputers retrieves all computers from the database
 func getComputers() ([]Computer, error) {
-	rows, err := db.Query("SELECT id, place, username, ip FROM computers ORDER BY created_at DESC")
+	rows, err := db.Query("SELECT id, place, username, ip, os_name FROM computers ORDER BY created_at DESC")
 	if err != nil {
 		log.Printf("ERROR: Failed to query computers: %v", err)
 		return nil, err
@@ -77,7 +88,7 @@ func getComputers() ([]Computer, error) {
 	var computers []Computer
 	for rows.Next() {
 		var c Computer
-		if err := rows.Scan(&c.ID, &c.Place, &c.Username, &c.IP); err != nil {
+		if err := rows.Scan(&c.ID, &c.Place, &c.Username, &c.IP, &c.OS); err != nil {
 			log.Printf("ERROR: Failed to scan computer row: %v", err)
 			return nil, err
 		}
@@ -95,8 +106,8 @@ func getComputers() ([]Computer, error) {
 // createComputer inserts a new computer into the database
 func createComputer(c Computer) error {
 	_, err := db.Exec(
-		"INSERT INTO computers (id, place, username, ip) VALUES (?, ?, ?, ?)",
-		c.ID, c.Place, c.Username, c.IP,
+		"INSERT INTO computers (id, place, username, ip, os_name) VALUES (?, ?, ?, ?, ?)",
+		c.ID, c.Place, c.Username, c.IP, c.OS,
 	)
 	if err != nil {
 		log.Printf("ERROR: Failed to insert computer: %v", err)
@@ -137,6 +148,27 @@ func updateComputer(c Computer) error {
 	}
 
 	log.Printf("INFO: Computer updated - ID: %s, Place: %s, Username: %s, IP: %s", c.ID, c.Place, c.Username, c.IP)
+	return nil
+}
+
+// updateComputerOS updates only os_name for an existing computer.
+func updateComputerOS(id, osName string) error {
+	result, err := db.Exec("UPDATE computers SET os_name = ? WHERE id = ?", osName, id)
+	if err != nil {
+		log.Printf("ERROR: Failed to update OS for ID %s: %v", id, err)
+		return err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("ERROR: Failed to get rows affected for OS update: %v", err)
+		return err
+	}
+	if rowsAffected == 0 {
+		return sql.ErrNoRows
+	}
+
+	log.Printf("INFO: Computer OS updated - ID: %s, OS: %s", id, osName)
 	return nil
 }
 

@@ -199,6 +199,93 @@
     </div>
 
     <!-- ============================================================================ -->
+    <!-- System Info Full-Page View -->
+    <!-- ============================================================================ -->
+    <div id="system-info-page" class="system-info-page">
+      <div class="system-info-page__header">
+        <div>
+          <h2 id="system-info-title">System Insights</h2>
+          <p id="system-info-subtitle">Collecting host metrics...</p>
+        </div>
+        <button id="system-info-close" class="system-info-page__close" title="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+
+      <div class="system-info-page__content">
+        <p id="system-info-message" class="system-info-page__message"></p>
+
+        <div class="system-info-page__meta">
+          <div class="system-info-chip">
+            <span class="system-info-chip__label">Operating System</span>
+            <strong id="system-info-os">-</strong>
+          </div>
+          <div class="system-info-chip">
+            <span class="system-info-chip__label">CPU Model</span>
+            <strong id="system-info-cpu-model">-</strong>
+          </div>
+          <div class="system-info-chip">
+            <span class="system-info-chip__label">CPU Topology</span>
+            <strong id="system-info-cpu-arch">-</strong>
+          </div>
+          <div class="system-info-chip">
+            <span class="system-info-chip__label">Collected At</span>
+            <strong id="system-info-updated">-</strong>
+          </div>
+        </div>
+
+        <div class="system-info-grid">
+          <article class="system-metric-card">
+            <h3>CPU Load</h3>
+            <p class="system-metric-card__value" id="system-cpu-percent">0%</p>
+            <div class="system-meter">
+              <span id="system-cpu-bar"></span>
+            </div>
+            <p class="system-metric-card__detail" id="system-cpu-text">-</p>
+          </article>
+
+          <article class="system-metric-card">
+            <h3>RAM Usage</h3>
+            <p class="system-metric-card__value" id="system-memory-percent">0%</p>
+            <div class="system-meter">
+              <span id="system-memory-bar"></span>
+            </div>
+            <p class="system-metric-card__detail" id="system-memory-text">0 GB / 0 GB</p>
+          </article>
+
+          <article class="system-metric-card">
+            <h3>Storage Usage ( / )</h3>
+            <p class="system-metric-card__value" id="system-disk-percent">0%</p>
+            <div class="system-meter">
+              <span id="system-disk-bar"></span>
+            </div>
+            <p class="system-metric-card__detail" id="system-disk-text">0 GB / 0 GB</p>
+          </article>
+        </div>
+
+        <div class="system-command-grid">
+          <article class="system-command-card">
+            <h3>lscpu</h3>
+            <pre id="system-cmd-lscpu">-</pre>
+          </article>
+
+          <article class="system-command-card">
+            <h3>free -h</h3>
+            <pre id="system-cmd-free">-</pre>
+          </article>
+
+          <article class="system-command-card">
+            <h3>dmesg (tail)</h3>
+            <pre id="system-cmd-dmesg">-</pre>
+          </article>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================================================ -->
     <!-- Toast Notification -->
     <!-- ============================================================================ -->
     <div id="toast" class="toast"></div>
