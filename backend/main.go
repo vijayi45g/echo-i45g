@@ -5,17 +5,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/user"
+	pathpkg "path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
 )
@@ -82,10 +87,15 @@ func pingHost(ip string) string {
 
 // setCORS configures CORS headers for cross-origin requests
 func setCORS(w http.ResponseWriter) {
+	setCORSHeaders(w)
+	w.Header().Set("Content-Type", "application/json")
+}
+
+// setCORSHeaders configures only CORS headers (without forcing response type).
+func setCORSHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-	w.Header().Set("Content-Type", "application/json")
 }
 
 // writeJSON writes a JSON response with the specified HTTP status code
@@ -374,6 +384,336 @@ type TerminalResponse struct {
 	Error  string `json:"error,omitempty"`
 }
 
+type FileTransferRoot struct {
+	Label  string `json:"label"`
+	Path   string `json:"path"`
+	Exists bool   `json:"exists"`
+}
+
+type FileTransferEntry struct {
+	Name       string `json:"name"`
+	Path       string `json:"path"`
+	IsDir      bool   `json:"isDir"`
+	SizeBytes  int64  `json:"sizeBytes"`
+	ModifiedAt string `json:"modifiedAt"`
+}
+
+type FileTransferListResponse struct {
+	ComputerID  string              `json:"computerId"`
+	CurrentPath string              `json:"currentPath"`
+	HomePath    string              `json:"homePath"`
+	ParentPath  string              `json:"parentPath"`
+	Roots       []FileTransferRoot  `json:"roots"`
+	Entries     []FileTransferEntry `json:"entries"`
+}
+
+type FileTransferCopyRequest struct {
+	SourceComputerID string `json:"sourceComputerId"`
+	SourcePath       string `json:"sourcePath"`
+	TargetComputerID string `json:"targetComputerId"`
+	TargetPath       string `json:"targetPath,omitempty"`
+	Mode             string `json:"mode,omitempty"` // "copy" (default), "merge", "merge_newer"
+}
+
+type FileTransferUndoRequest struct {
+	ComputerID string `json:"computerId"`
+}
+
+// normalizeComputerHost strips spaces/brackets and optional :port so host/IP
+// comparisons are consistent.
+func normalizeComputerHost(raw string) string {
+	host := strings.TrimSpace(raw)
+	if host == "" {
+		return ""
+	}
+
+	// Handle bracketed IPv6 with optional port, e.g. [::1]:22.
+	if strings.HasPrefix(host, "[") {
+		if idx := strings.Index(host, "]"); idx > 0 {
+			inner := host[1:idx]
+			rest := host[idx+1:]
+			if rest == "" || strings.HasPrefix(rest, ":") {
+				return strings.TrimSpace(inner)
+			}
+		}
+	}
+
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+
+	return strings.Trim(strings.TrimSpace(host), "[]")
+}
+
+func localInterfaceIPs() map[string]struct{} {
+	localIPs := make(map[string]struct{})
+
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		log.Printf("WARNING: Failed to read local interface IPs: %v", err)
+		return localIPs
+	}
+
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		default:
+			continue
+		}
+
+		if ip == nil {
+			continue
+		}
+
+		localIPs[ip.String()] = struct{}{}
+		if v4 := ip.To4(); v4 != nil {
+			localIPs[v4.String()] = struct{}{}
+		}
+	}
+
+	return localIPs
+}
+
+// isServerComputer returns true when the computer entry points to this server
+// itself (localhost, loopback, hostname, or any local interface IP).
+func isServerComputer(c Computer) bool {
+	targetHost := normalizeComputerHost(c.IP)
+	if targetHost == "" {
+		return false
+	}
+
+	if strings.EqualFold(targetHost, "localhost") {
+		return true
+	}
+
+	if hostname, err := os.Hostname(); err == nil {
+		if strings.EqualFold(targetHost, normalizeComputerHost(hostname)) {
+			return true
+		}
+	}
+
+	targetIP := net.ParseIP(targetHost)
+	if targetIP == nil {
+		return false
+	}
+	if targetIP.IsLoopback() {
+		return true
+	}
+
+	localIPs := localInterfaceIPs()
+	if _, ok := localIPs[targetIP.String()]; ok {
+		return true
+	}
+	if targetV4 := targetIP.To4(); targetV4 != nil {
+		if _, ok := localIPs[targetV4.String()]; ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+func getComputerByID(id string) (*Computer, error) {
+	computers, err := getComputers()
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range computers {
+		if computers[i].ID == id {
+			return &computers[i], nil
+		}
+	}
+	return nil, nil
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+}
+
+func sanitizeDownloadName(name string) string {
+	clean := strings.TrimSpace(name)
+	clean = strings.ReplaceAll(clean, "/", "_")
+	clean = strings.ReplaceAll(clean, "\\", "_")
+	if clean == "" || clean == "." || clean == ".." {
+		return "download"
+	}
+	return clean
+}
+
+func pathWithinHome(targetPath, homePath string) bool {
+	targetPath = pathpkg.Clean(targetPath)
+	homePath = pathpkg.Clean(homePath)
+	return targetPath == homePath || strings.HasPrefix(targetPath, homePath+"/")
+}
+
+func normalizeComputerPath(rawPath, homePath string) (string, error) {
+	homePath = pathpkg.Clean(strings.TrimSpace(homePath))
+	if homePath == "" || !strings.HasPrefix(homePath, "/") {
+		return "", errors.New("invalid home path")
+	}
+
+	p := strings.TrimSpace(rawPath)
+	if p == "" {
+		return "", errors.New("path is required")
+	}
+
+	var absolute string
+	switch {
+	case p == "~":
+		absolute = homePath
+	case strings.HasPrefix(p, "~/"):
+		absolute = pathpkg.Join(homePath, strings.TrimPrefix(p, "~/"))
+	case strings.HasPrefix(p, "/"):
+		absolute = pathpkg.Clean(p)
+	default:
+		absolute = pathpkg.Join(homePath, p)
+	}
+
+	if !strings.HasPrefix(absolute, "/") {
+		absolute = "/" + strings.TrimPrefix(absolute, "/")
+	}
+
+	if !pathWithinHome(absolute, homePath) {
+		return "", errors.New("path must stay inside the user home directory")
+	}
+
+	return absolute, nil
+}
+
+func getComputerHomePath(computer Computer) (string, error) {
+	out, err := executeCommandForComputer(computer, `printf %s "$HOME"`)
+	if err != nil {
+		return "", err
+	}
+
+	home := strings.TrimSpace(out)
+	if home == "" || !strings.HasPrefix(home, "/") {
+		return "", errors.New("failed to resolve home directory")
+	}
+	return pathpkg.Clean(home), nil
+}
+
+func remotePathType(computer Computer, absolutePath string) (string, error) {
+	q := shellQuote(absolutePath)
+	cmd := fmt.Sprintf(`if [ -d %s ]; then echo dir; elif [ -f %s ]; then echo file; else echo missing; fi`, q, q)
+	out, err := executeCommandForComputer(computer, cmd)
+	if err != nil {
+		return "", err
+	}
+	kind := strings.TrimSpace(out)
+	switch kind {
+	case "dir", "file", "missing":
+		return kind, nil
+	default:
+		return "", fmt.Errorf("unexpected path type output: %q", kind)
+	}
+}
+
+func buildFileTransferRoots(computer Computer, homePath string) []FileTransferRoot {
+	candidates := []FileTransferRoot{
+		{Label: "Documents", Path: pathpkg.Join(homePath, "Documents")},
+		{Label: "Downloads", Path: pathpkg.Join(homePath, "Downloads")},
+		{Label: "Home", Path: homePath, Exists: true},
+	}
+
+	for i := range candidates {
+		if candidates[i].Label == "Home" {
+			continue
+		}
+		kind, err := remotePathType(computer, candidates[i].Path)
+		candidates[i].Exists = err == nil && kind == "dir"
+	}
+
+	return candidates
+}
+
+func chooseDefaultBrowsePath(roots []FileTransferRoot, homePath string) string {
+	for _, root := range roots {
+		if root.Exists && root.Path != "" && root.Label != "Home" {
+			return root.Path
+		}
+	}
+	return homePath
+}
+
+func chooseDefaultPastePath(computer Computer, homePath string) string {
+	downloads := pathpkg.Join(homePath, "Downloads")
+	kind, err := remotePathType(computer, downloads)
+	if err == nil && kind == "dir" {
+		return downloads
+	}
+	return homePath
+}
+
+func listDirectoryEntries(computer Computer, dirPath string, homePath string) ([]FileTransferEntry, error) {
+	q := shellQuote(dirPath)
+	cmd := fmt.Sprintf(
+		`if [ ! -d %s ]; then echo "__NOT_DIRECTORY__"; exit 0; fi; find %s -mindepth 1 -maxdepth 1 -printf '%%y\t%%f\t%%p\t%%s\t%%TY-%%Tm-%%Td %%TH:%%TM\n' 2>/dev/null | sort -f`,
+		q, q,
+	)
+
+	out, err := executeCommandForComputer(computer, cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	if strings.TrimSpace(out) == "__NOT_DIRECTORY__" {
+		return nil, errors.New("selected path is not a directory")
+	}
+
+	entries := make([]FileTransferEntry, 0)
+	lines := strings.Split(out, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		parts := strings.SplitN(line, "\t", 5)
+		if len(parts) < 5 {
+			continue
+		}
+
+		entryPath := strings.TrimSpace(parts[2])
+		if entryPath == "" || !pathWithinHome(entryPath, homePath) {
+			continue
+		}
+
+		sizeBytes, _ := strconv.ParseInt(strings.TrimSpace(parts[3]), 10, 64)
+		entries = append(entries, FileTransferEntry{
+			Name:       strings.TrimSpace(parts[1]),
+			Path:       entryPath,
+			IsDir:      strings.TrimSpace(parts[0]) == "d",
+			SizeBytes:  sizeBytes,
+			ModifiedAt: strings.TrimSpace(parts[4]),
+		})
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].IsDir != entries[j].IsDir {
+			return entries[i].IsDir && !entries[j].IsDir
+		}
+		return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
+	})
+
+	return entries, nil
+}
+
+func executeCommandForComputer(computer Computer, command string) (string, error) {
+	if isServerComputer(computer) {
+		return executeLocalCommand(command)
+	}
+	return executeSSHCommand(computer.IP, computer.Username, command)
+}
+
 // SystemInfo contains host OS + memory/disk metrics from a remote Linux machine.
 type SystemInfo struct {
 	ComputerID         string  `json:"computerId"`
@@ -390,37 +730,30 @@ type SystemInfo struct {
 	CollectedAt        string  `json:"collectedAt"`
 }
 
-type CPUCommandOutput struct {
-	Free  string `json:"free"`
-	LSCPU string `json:"lscpu"`
-	Dmesg string `json:"dmesg"`
-}
-
 type CPUOverview struct {
-	ComputerID         string           `json:"computerId"`
-	Place              string           `json:"place"`
-	Username           string           `json:"username"`
-	IP                 string           `json:"ip"`
-	OS                 string           `json:"os"`
-	Kernel             string           `json:"kernel"`
-	Uptime             string           `json:"uptime"`
-	Architecture       string           `json:"architecture"`
-	CPUModel           string           `json:"cpuModel"`
-	CoreCount          int              `json:"coreCount"`
-	ThreadsPerCore     int              `json:"threadsPerCore"`
-	SocketCount        int              `json:"socketCount"`
-	Load1              float64          `json:"load1"`
-	Load5              float64          `json:"load5"`
-	Load15             float64          `json:"load15"`
-	CPUUsagePercent    float64          `json:"cpuUsagePercent"`
-	MemoryTotalGB      float64          `json:"memoryTotalGB"`
-	MemoryUsedGB       float64          `json:"memoryUsedGB"`
-	MemoryUsagePercent float64          `json:"memoryUsagePercent"`
-	DiskTotalGB        float64          `json:"diskTotalGB"`
-	DiskUsedGB         float64          `json:"diskUsedGB"`
-	DiskUsagePercent   float64          `json:"diskUsagePercent"`
-	Commands           CPUCommandOutput `json:"commands"`
-	CollectedAt        string           `json:"collectedAt"`
+	ComputerID         string  `json:"computerId"`
+	Place              string  `json:"place"`
+	Username           string  `json:"username"`
+	IP                 string  `json:"ip"`
+	OS                 string  `json:"os"`
+	Kernel             string  `json:"kernel"`
+	Uptime             string  `json:"uptime"`
+	Architecture       string  `json:"architecture"`
+	CPUModel           string  `json:"cpuModel"`
+	CoreCount          int     `json:"coreCount"`
+	ThreadsPerCore     int     `json:"threadsPerCore"`
+	SocketCount        int     `json:"socketCount"`
+	Load1              float64 `json:"load1"`
+	Load5              float64 `json:"load5"`
+	Load15             float64 `json:"load15"`
+	CPUUsagePercent    float64 `json:"cpuUsagePercent"`
+	MemoryTotalGB      float64 `json:"memoryTotalGB"`
+	MemoryUsedGB       float64 `json:"memoryUsedGB"`
+	MemoryUsagePercent float64 `json:"memoryUsagePercent"`
+	DiskTotalGB        float64 `json:"diskTotalGB"`
+	DiskUsedGB         float64 `json:"diskUsedGB"`
+	DiskUsagePercent   float64 `json:"diskUsagePercent"`
+	CollectedAt        string  `json:"collectedAt"`
 }
 
 func round2(v float64) float64 {
@@ -474,13 +807,6 @@ func parseIntOrZero(value string) int {
 	return v
 }
 
-func truncateText(value string, maxLen int) string {
-	if len(value) <= maxLen {
-		return value
-	}
-	return value[:maxLen] + "\n...truncated..."
-}
-
 func collectSystemInfo(computer Computer) (SystemInfo, error) {
 	// Linux-focused script (Debian/Ubuntu compatible).
 	// Emits KEY=VALUE lines for predictable parsing.
@@ -512,14 +838,14 @@ echo "DISK_USED_PCT=$DISK_USED_PCT"
 `
 
 	command := fmt.Sprintf("bash -lc %q", script)
-	output, err := executeSSHCommand(computer.IP, computer.Username, command)
+	output, err := executeCommandForComputer(computer, command)
 	if err != nil {
 		return SystemInfo{}, err
 	}
 
 	values := parseKeyValueOutput(output)
 	if len(values) == 0 {
-		return SystemInfo{}, errors.New("unable to parse system metrics from SSH output")
+		return SystemInfo{}, errors.New("unable to parse system metrics from command output")
 	}
 
 	memoryTotalKB := parseFloatOrZero(values["MEM_TOTAL_KB"])
@@ -600,14 +926,14 @@ echo "UPTIME=$UPTIME"
 `
 
 	summaryCommand := fmt.Sprintf("bash -lc %q", summaryScript)
-	summaryOut, err := executeSSHCommand(computer.IP, computer.Username, summaryCommand)
+	summaryOut, err := executeCommandForComputer(computer, summaryCommand)
 	if err != nil {
 		return CPUOverview{}, err
 	}
 
 	summary := parseKeyValueOutput(summaryOut)
 	if len(summary) == 0 {
-		return CPUOverview{}, errors.New("unable to parse cpu overview metrics from SSH output")
+		return CPUOverview{}, errors.New("unable to parse cpu overview metrics from command output")
 	}
 
 	coreCount := parseIntOrZero(summary["CORES"])
@@ -623,20 +949,6 @@ echo "UPTIME=$UPTIME"
 		cpuUsagePercent = (load1 / float64(coreCount)) * 100
 	}
 	cpuUsagePercent = clamp(cpuUsagePercent, 0, 100)
-
-	freeOut, _ := executeSSHCommand(computer.IP, computer.Username, "free -h 2>&1")
-	lscpuOut, _ := executeSSHCommand(computer.IP, computer.Username, "lscpu 2>&1")
-	dmesgOut, _ := executeSSHCommand(computer.IP, computer.Username, "dmesg 2>&1 | tail -n 25")
-
-	if strings.TrimSpace(freeOut) == "" {
-		freeOut = "No output from free -h"
-	}
-	if strings.TrimSpace(lscpuOut) == "" {
-		lscpuOut = "No output from lscpu"
-	}
-	if strings.TrimSpace(dmesgOut) == "" {
-		dmesgOut = "No output from dmesg"
-	}
 
 	return CPUOverview{
 		ComputerID:         computer.ID,
@@ -661,12 +973,7 @@ echo "UPTIME=$UPTIME"
 		DiskTotalGB:        systemInfo.DiskTotalGB,
 		DiskUsedGB:         systemInfo.DiskUsedGB,
 		DiskUsagePercent:   systemInfo.DiskUsagePercent,
-		Commands: CPUCommandOutput{
-			Free:  truncateText(freeOut, 6000),
-			LSCPU: truncateText(lscpuOut, 6000),
-			Dmesg: truncateText(dmesgOut, 6000),
-		},
-		CollectedAt: systemInfo.CollectedAt,
+		CollectedAt:        systemInfo.CollectedAt,
 	}, nil
 }
 
@@ -781,6 +1088,210 @@ func executeSSHCommand(ip, username, command string) (string, error) {
 	return output, nil
 }
 
+func streamSSHCommandOutput(ip, username, command string, writer io.Writer) (string, error) {
+	if username == "" {
+		username = "root"
+	}
+
+	authMethods, err := getSSHConfig(username)
+	if err != nil {
+		return "", err
+	}
+
+	config := &ssh.ClientConfig{
+		User:            username,
+		Auth:            authMethods,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // ⚠️ Only for trusted internal networks
+		Timeout:         20 * time.Second,
+	}
+
+	client, err := ssh.Dial("tcp", net.JoinHostPort(ip, "22"), config)
+	if err != nil {
+		return "", fmt.Errorf("SSH connection failed: %w", err)
+	}
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("SSH session failed: %w", err)
+	}
+	defer session.Close()
+
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+
+	var stderr bytes.Buffer
+	session.Stderr = &stderr
+
+	if err := session.Start(command); err != nil {
+		return stderr.String(), err
+	}
+
+	if _, err := io.Copy(writer, stdout); err != nil {
+		return stderr.String(), err
+	}
+
+	if err := session.Wait(); err != nil {
+		return stderr.String(), err
+	}
+
+	return stderr.String(), nil
+}
+
+func streamLocalCommandOutput(command string, writer io.Writer) (string, error) {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/bash"
+	}
+
+	cmd := exec.Command(shell, "-lc", command)
+	cmd.Env = os.Environ()
+	cmd.Stdout = writer
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return stderr.String(), err
+	}
+
+	return stderr.String(), nil
+}
+
+func streamCommandOutputForComputer(computer Computer, command string, writer io.Writer) (string, error) {
+	if isServerComputer(computer) {
+		return streamLocalCommandOutput(command, writer)
+	}
+	return streamSSHCommandOutput(computer.IP, computer.Username, command, writer)
+}
+
+func streamSSHCommandInput(ip, username, command string, reader io.Reader) (string, error) {
+	if username == "" {
+		username = "root"
+	}
+
+	authMethods, err := getSSHConfig(username)
+	if err != nil {
+		return "", err
+	}
+
+	config := &ssh.ClientConfig{
+		User:            username,
+		Auth:            authMethods,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // ⚠️ Only for trusted internal networks
+		Timeout:         20 * time.Second,
+	}
+
+	client, err := ssh.Dial("tcp", net.JoinHostPort(ip, "22"), config)
+	if err != nil {
+		return "", fmt.Errorf("SSH connection failed: %w", err)
+	}
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("SSH session failed: %w", err)
+	}
+	defer session.Close()
+
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return "", err
+	}
+
+	session.Stdout = io.Discard
+	var stderr bytes.Buffer
+	session.Stderr = &stderr
+
+	if err := session.Start(command); err != nil {
+		return stderr.String(), err
+	}
+
+	if _, err := io.Copy(stdin, reader); err != nil {
+		_ = stdin.Close()
+		return stderr.String(), err
+	}
+	_ = stdin.Close()
+
+	if err := session.Wait(); err != nil {
+		return stderr.String(), err
+	}
+
+	return stderr.String(), nil
+}
+
+func streamLocalCommandInput(command string, reader io.Reader) (string, error) {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/bash"
+	}
+
+	cmd := exec.Command(shell, "-lc", command)
+	cmd.Env = os.Environ()
+	cmd.Stdin = reader
+	cmd.Stdout = io.Discard
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return stderr.String(), err
+	}
+
+	return stderr.String(), nil
+}
+
+func streamCommandInputForComputer(computer Computer, command string, reader io.Reader) (string, error) {
+	if isServerComputer(computer) {
+		return streamLocalCommandInput(command, reader)
+	}
+	return streamSSHCommandInput(computer.IP, computer.Username, command, reader)
+}
+
+func executeCommandStrictForComputer(computer Computer, command string) (string, error) {
+	var stdout bytes.Buffer
+	stderr, err := streamCommandOutputForComputer(computer, command, &stdout)
+	if err != nil {
+		if strings.TrimSpace(stderr) != "" {
+			return strings.TrimSpace(stderr), err
+		}
+		if stdout.Len() > 0 {
+			return strings.TrimSpace(stdout.String()), err
+		}
+		return "", err
+	}
+
+	return strings.TrimSpace(stdout.String()), nil
+}
+
+// executeLocalCommand runs a shell command on the local server instead of over SSH.
+// Used when the selected computer is the monitoring server itself.
+func executeLocalCommand(command string) (string, error) {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/bash"
+	}
+
+	cmd := exec.Command(shell, "-lc", command)
+	cmd.Env = os.Environ()
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		log.Printf("WARNING: Local command failed: %v", err)
+		if stderr.Len() > 0 {
+			return stderr.String(), nil
+		}
+		return "", fmt.Errorf("local command failed: %w", err)
+	}
+
+	return stdout.String(), nil
+}
+
 // executeTerminal handles POST /api/terminal/execute
 func executeTerminal(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
@@ -828,14 +1339,17 @@ func executeTerminal(w http.ResponseWriter, r *http.Request) {
 		log.Printf("WARNING: Attempt to execute terminal command on non-existent computer: %s", req.ComputerID)
 		return
 	}
-
-	output, err := executeSSHCommand(computer.IP, computer.Username, req.Command)
+	output, err := executeCommandForComputer(*computer, req.Command)
 	if err != nil {
+		executionType := "SSH"
+		if isServerComputer(*computer) {
+			executionType = "local shell"
+		}
 		writeJSON(w, http.StatusInternalServerError, APIResponse{
 			Success: false,
-			Error:   fmt.Sprintf("SSH execution failed: %v", err),
+			Error:   fmt.Sprintf("%s execution failed: %v", executionType, err),
 		})
-		log.Printf("ERROR: SSH command execution failed for %s@%s (%s): %v", computer.Username, computer.Place, computer.IP, err)
+		log.Printf("ERROR: %s command execution failed for %s@%s (%s): %v", executionType, computer.Username, computer.Place, computer.IP, err)
 		return
 	}
 
@@ -848,8 +1362,648 @@ func executeTerminal(w http.ResponseWriter, r *http.Request) {
 	log.Printf("INFO: Terminal command executed on %s@%s (%s) - Command: %s", computer.Username, computer.Place, computer.IP, req.Command)
 }
 
+// listComputerFiles handles GET /api/file-transfer/list?computerId=:id&path=:path
+func listComputerFiles(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+
+	computerID := strings.TrimSpace(r.URL.Query().Get("computerId"))
+	if computerID == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "computerId is required",
+		})
+		return
+	}
+
+	computer, err := getComputerByID(computerID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   "Failed to retrieve computers",
+		})
+		return
+	}
+	if computer == nil {
+		writeJSON(w, http.StatusNotFound, APIResponse{
+			Success: false,
+			Error:   "Computer not found",
+		})
+		return
+	}
+
+	homePath, err := getComputerHomePath(*computer)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to resolve home directory: %v", err),
+		})
+		return
+	}
+
+	roots := buildFileTransferRoots(*computer, homePath)
+	pathArg := strings.TrimSpace(r.URL.Query().Get("path"))
+
+	currentPath := chooseDefaultBrowsePath(roots, homePath)
+	if pathArg != "" {
+		currentPath, err = normalizeComputerPath(pathArg, homePath)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, APIResponse{
+				Success: false,
+				Error:   err.Error(),
+			})
+			return
+		}
+	}
+
+	pathType, err := remotePathType(*computer, currentPath)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to inspect selected path: %v", err),
+		})
+		return
+	}
+	if pathType == "missing" {
+		writeJSON(w, http.StatusNotFound, APIResponse{
+			Success: false,
+			Error:   "Selected path does not exist",
+		})
+		return
+	}
+	if pathType != "dir" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "Selected path must be a directory",
+		})
+		return
+	}
+
+	entries, err := listDirectoryEntries(*computer, currentPath, homePath)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to list directory: %v", err),
+		})
+		return
+	}
+
+	parentPath := ""
+	if currentPath != homePath {
+		candidate := pathpkg.Dir(currentPath)
+		if pathWithinHome(candidate, homePath) {
+			parentPath = candidate
+		}
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: FileTransferListResponse{
+			ComputerID:  computer.ID,
+			CurrentPath: currentPath,
+			HomePath:    homePath,
+			ParentPath:  parentPath,
+			Roots:       roots,
+			Entries:     entries,
+		},
+	})
+}
+
+// downloadComputerPath handles GET /api/file-transfer/download?computerId=:id&path=:path
+func downloadComputerPath(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	sendError := func(code int, message string) {
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(w, code, APIResponse{
+			Success: false,
+			Error:   message,
+		})
+	}
+
+	computerID := strings.TrimSpace(r.URL.Query().Get("computerId"))
+	pathArg := strings.TrimSpace(r.URL.Query().Get("path"))
+	if computerID == "" || pathArg == "" {
+		sendError(http.StatusBadRequest, "computerId and path are required")
+		return
+	}
+
+	computer, err := getComputerByID(computerID)
+	if err != nil {
+		sendError(http.StatusInternalServerError, "Failed to retrieve computers")
+		return
+	}
+	if computer == nil {
+		sendError(http.StatusNotFound, "Computer not found")
+		return
+	}
+
+	homePath, err := getComputerHomePath(*computer)
+	if err != nil {
+		sendError(http.StatusInternalServerError, fmt.Sprintf("Failed to resolve home directory: %v", err))
+		return
+	}
+
+	absolutePath, err := normalizeComputerPath(pathArg, homePath)
+	if err != nil {
+		sendError(http.StatusBadRequest, err.Error())
+		return
+	}
+
+	pathType, err := remotePathType(*computer, absolutePath)
+	if err != nil {
+		sendError(http.StatusInternalServerError, fmt.Sprintf("Failed to inspect selected path: %v", err))
+		return
+	}
+	if pathType == "missing" {
+		sendError(http.StatusNotFound, "Selected path does not exist")
+		return
+	}
+	if pathType != "dir" && pathType != "file" {
+		sendError(http.StatusBadRequest, "Only files or directories can be downloaded")
+		return
+	}
+
+	baseName := sanitizeDownloadName(pathpkg.Base(absolutePath))
+	contentType := "application/octet-stream"
+	command := fmt.Sprintf("cat %s", shellQuote(absolutePath))
+	downloadName := baseName
+
+	if pathType == "dir" {
+		command = fmt.Sprintf(
+			"tar -czf - -C %s %s",
+			shellQuote(pathpkg.Dir(absolutePath)),
+			shellQuote(pathpkg.Base(absolutePath)),
+		)
+		contentType = "application/gzip"
+		downloadName = baseName + ".tar.gz"
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", downloadName))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	if stderr, err := streamCommandOutputForComputer(*computer, command, w); err != nil {
+		log.Printf(
+			"ERROR: Download failed for %s@%s (%s) path=%s err=%v stderr=%s",
+			computer.Username,
+			computer.Place,
+			computer.IP,
+			absolutePath,
+			err,
+			strings.TrimSpace(stderr),
+		)
+	}
+}
+
+// copyComputerPath handles POST /api/file-transfer/copy
+// Copies one file/folder from source computer to target computer.
+func copyComputerPath(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+
+	var req FileTransferCopyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "Invalid JSON body",
+		})
+		return
+	}
+
+	req.SourceComputerID = strings.TrimSpace(req.SourceComputerID)
+	req.TargetComputerID = strings.TrimSpace(req.TargetComputerID)
+	req.SourcePath = strings.TrimSpace(req.SourcePath)
+	req.TargetPath = strings.TrimSpace(req.TargetPath)
+	req.Mode = strings.ToLower(strings.TrimSpace(req.Mode))
+	if req.Mode == "" {
+		req.Mode = "copy"
+	}
+
+	if req.SourceComputerID == "" || req.TargetComputerID == "" || req.SourcePath == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "sourceComputerId, sourcePath and targetComputerId are required",
+		})
+		return
+	}
+
+	if req.Mode != "copy" && req.Mode != "merge" && req.Mode != "merge_newer" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "mode must be either \"copy\", \"merge\" or \"merge_newer\"",
+		})
+		return
+	}
+
+	sourceComputer, err := getComputerByID(req.SourceComputerID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   "Failed to retrieve source computer",
+		})
+		return
+	}
+	if sourceComputer == nil {
+		writeJSON(w, http.StatusNotFound, APIResponse{
+			Success: false,
+			Error:   "Source computer not found",
+		})
+		return
+	}
+
+	targetComputer, err := getComputerByID(req.TargetComputerID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   "Failed to retrieve target computer",
+		})
+		return
+	}
+	if targetComputer == nil {
+		writeJSON(w, http.StatusNotFound, APIResponse{
+			Success: false,
+			Error:   "Target computer not found",
+		})
+		return
+	}
+
+	sourceHome, err := getComputerHomePath(*sourceComputer)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to resolve source home: %v", err),
+		})
+		return
+	}
+
+	targetHome, err := getComputerHomePath(*targetComputer)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to resolve target home: %v", err),
+		})
+		return
+	}
+
+	sourcePath, err := normalizeComputerPath(req.SourcePath, sourceHome)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	targetRawPath := req.TargetPath
+	if targetRawPath == "" {
+		targetRawPath = chooseDefaultPastePath(*targetComputer, targetHome)
+	}
+
+	targetPath, err := normalizeComputerPath(targetRawPath, targetHome)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	sourceType, err := remotePathType(*sourceComputer, sourcePath)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to inspect source path: %v", err),
+		})
+		return
+	}
+	if sourceType == "missing" {
+		writeJSON(w, http.StatusNotFound, APIResponse{
+			Success: false,
+			Error:   "Source path does not exist",
+		})
+		return
+	}
+	if sourceType != "file" && sourceType != "dir" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "Source path must be a file or directory",
+		})
+		return
+	}
+
+	targetType, err := remotePathType(*targetComputer, targetPath)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to inspect target path: %v", err),
+		})
+		return
+	}
+	if targetType != "dir" {
+		createTargetCmd := fmt.Sprintf("mkdir -p %s", shellQuote(targetPath))
+		stderr, mkdirErr := executeCommandStrictForComputer(*targetComputer, createTargetCmd)
+		if mkdirErr != nil {
+			writeJSON(w, http.StatusInternalServerError, APIResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Failed to create target directory: %v %s", mkdirErr, strings.TrimSpace(stderr)),
+			})
+			return
+		}
+	}
+
+	if req.SourceComputerID == req.TargetComputerID {
+		var copyCmd string
+		if req.Mode == "merge_newer" {
+			// Merge-newer on the same computer with undo support via rsync backups.
+			// Works for both files and directories.
+			rsyncScript := fmt.Sprintf(`bash -lc %s`, shellQuote(fmt.Sprintf(`
+set -euo pipefail
+
+SRC=%s
+DEST=%s
+
+command -v rsync >/dev/null 2>&1 || { echo "rsync is required for merge_newer + undo but is not installed"; exit 2; }
+mkdir -p "$DEST"
+
+UNDO_BASE="$HOME/.pc-monitoring-undo"
+mkdir -p "$UNDO_BASE/ops"
+
+OP_ID="$(date +%%Y%%m%%d_%%H%%M%%S)_$RANDOM"
+OP_DIR="$UNDO_BASE/ops/$OP_ID"
+BACKUP_DIR="$OP_DIR/backup"
+mkdir -p "$BACKUP_DIR"
+printf '%%s' "$DEST" > "$OP_DIR/target.txt"
+
+RSYNC_LOG="$OP_DIR/rsync.log"
+if [ -d "$SRC" ]; then
+  rsync -a --update --backup --backup-dir="$BACKUP_DIR" --out-format='%%i|%%n' "$SRC"/ "$DEST"/ | tee "$RSYNC_LOG" >/dev/null
+else
+  rsync -a --update --backup --backup-dir="$BACKUP_DIR" --out-format='%%i|%%n' "$SRC" "$DEST"/ | tee "$RSYNC_LOG" >/dev/null
+fi
+
+CREATED_LIST="$OP_DIR/created.txt"
+awk -F'\\|' '$1 ~ /^>\\+\\+\\+\\+\\+\\+\\+\\+\\+/ {print $2}' "$RSYNC_LOG" > "$CREATED_LIST" || true
+
+echo "$OP_ID" > "$UNDO_BASE/last_op"
+echo "OK:$OP_ID"
+`, shellQuote(sourcePath), shellQuote(targetPath)))))
+
+			copyCmd = rsyncScript
+		} else if req.Mode == "merge" && sourceType == "dir" {
+			// Merge folder contents into targetPath (no extra subfolder).
+			copyCmd = fmt.Sprintf(
+				"mkdir -p %s && cp -a %s/. %s/",
+				shellQuote(targetPath),
+				shellQuote(sourcePath),
+				shellQuote(targetPath),
+			)
+		} else {
+			// Default behaviour: copy file or folder into targetPath (creates subfolder for directories).
+			copyCmd = fmt.Sprintf(
+				"mkdir -p %s && cp -a %s %s",
+				shellQuote(targetPath),
+				shellQuote(sourcePath),
+				shellQuote(targetPath),
+			)
+		}
+		if stderr, copyErr := executeCommandStrictForComputer(*sourceComputer, copyCmd); copyErr != nil {
+			writeJSON(w, http.StatusInternalServerError, APIResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Copy failed: %v %s", copyErr, strings.TrimSpace(stderr)),
+			})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, APIResponse{
+			Success: true,
+			Data: map[string]string{
+				"sourceComputerId": req.SourceComputerID,
+				"targetComputerId": req.TargetComputerID,
+				"sourcePath":       sourcePath,
+				"targetPath":       targetPath,
+			},
+		})
+		return
+	}
+
+	tmpFile, err := os.CreateTemp("", "pc-monitor-transfer-*.tar")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to create temp archive: %v", err),
+		})
+		return
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	var createArchiveCmd string
+	if (req.Mode == "merge" || req.Mode == "merge_newer") && sourceType == "dir" {
+		// For merge mode, archive only the contents of the folder so they can be
+		// extracted directly into targetPath without creating an extra subfolder.
+		createArchiveCmd = fmt.Sprintf(
+			"tar -cf - -C %s .",
+			shellQuote(sourcePath),
+		)
+	} else {
+		// Default behaviour: archive the file or folder name so it appears as a
+		// sub-item under the target directory.
+		createArchiveCmd = fmt.Sprintf(
+			"tar -cf - -C %s %s",
+			shellQuote(pathpkg.Dir(sourcePath)),
+			shellQuote(pathpkg.Base(sourcePath)),
+		)
+	}
+	if stderr, archiveErr := streamCommandOutputForComputer(*sourceComputer, createArchiveCmd, tmpFile); archiveErr != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to read source data: %v %s", archiveErr, strings.TrimSpace(stderr)),
+		})
+		return
+	}
+
+	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to rewind transfer archive: %v", err),
+		})
+		return
+	}
+
+	if req.Mode == "merge_newer" && sourceType == "dir" {
+		// Merge-newer across computers with undo support:
+		// 1) extract tar to a temp dir
+		// 2) rsync --update --backup into targetPath
+		// 3) record created files list so we can undo later
+		opScript := fmt.Sprintf(`bash -lc %s`, shellQuote(fmt.Sprintf(`
+set -euo pipefail
+
+TARGET=%s
+
+command -v rsync >/dev/null 2>&1 || { echo "rsync is required for merge_newer + undo but is not installed"; exit 2; }
+
+UNDO_BASE="$HOME/.pc-monitoring-undo"
+mkdir -p "$UNDO_BASE/ops"
+
+OP_ID="$(date +%%Y%%m%%d_%%H%%M%%S)_$RANDOM"
+OP_DIR="$UNDO_BASE/ops/$OP_ID"
+BACKUP_DIR="$OP_DIR/backup"
+mkdir -p "$BACKUP_DIR"
+printf '%%s' "$TARGET" > "$OP_DIR/target.txt"
+
+TMP_DIR="$(mktemp -d)"
+cleanup() { rm -rf "$TMP_DIR"; }
+trap cleanup EXIT
+
+tar -xf - -C "$TMP_DIR"
+
+# rsync output:
+# %i = itemized changes, %n = relative path
+RSYNC_LOG="$OP_DIR/rsync.log"
+rsync -a --update --backup --backup-dir="$BACKUP_DIR" --out-format='%%i|%%n' "$TMP_DIR"/ "$TARGET"/ | tee "$RSYNC_LOG" >/dev/null
+
+# Record created files so we can delete them on undo.
+# rsync itemize format: if first char is '>' and the second is 'f' or 'd', it's a transfer to receiver.
+# For newly created files/directories the "new" flag shows as '+++++++++' in %i.
+CREATED_LIST="$OP_DIR/created.txt"
+awk -F'\\|' '$1 ~ /^>\\+\\+\\+\\+\\+\\+\\+\\+\\+/ {print $2}' "$RSYNC_LOG" > "$CREATED_LIST" || true
+
+echo "$OP_ID" > "$UNDO_BASE/last_op"
+echo "OK:$OP_ID"
+`, shellQuote(targetPath)))))
+
+		if stderr, extractErr := streamCommandInputForComputer(*targetComputer, opScript, tmpFile); extractErr != nil {
+			writeJSON(w, http.StatusInternalServerError, APIResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Failed to merge_newer into target: %v %s", extractErr, strings.TrimSpace(stderr)),
+			})
+			return
+		}
+	} else {
+		extractArchiveCmd := fmt.Sprintf(
+			"mkdir -p %s && tar -xf - -C %s",
+			shellQuote(targetPath),
+			shellQuote(targetPath),
+		)
+		if stderr, extractErr := streamCommandInputForComputer(*targetComputer, extractArchiveCmd, tmpFile); extractErr != nil {
+			writeJSON(w, http.StatusInternalServerError, APIResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Failed to write target data: %v %s", extractErr, strings.TrimSpace(stderr)),
+			})
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]string{
+			"sourceComputerId": req.SourceComputerID,
+			"targetComputerId": req.TargetComputerID,
+			"sourcePath":       sourcePath,
+			"targetPath":       targetPath,
+			"mode":             req.Mode,
+		},
+	})
+}
+
+// undoLastMerge handles POST /api/file-transfer/undo
+// Restores the last merge_newer operation on the selected computer.
+func undoLastMerge(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+
+	var req FileTransferUndoRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: "Invalid JSON body"})
+		return
+	}
+	req.ComputerID = strings.TrimSpace(req.ComputerID)
+	if req.ComputerID == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: "computerId is required"})
+		return
+	}
+
+	computer, err := getComputerByID(req.ComputerID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "Failed to retrieve computers"})
+		return
+	}
+	if computer == nil {
+		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Error: "Computer not found"})
+		return
+	}
+
+	undoCmd := `bash -lc '
+set -euo pipefail
+command -v rsync >/dev/null 2>&1 || { echo "rsync is required for undo but is not installed"; exit 2; }
+
+UNDO_BASE="$HOME/.pc-monitoring-undo"
+LAST_FILE="$UNDO_BASE/last_op"
+if [ ! -f "$LAST_FILE" ]; then
+  echo "No merge operation to undo."
+  exit 3
+fi
+
+OP_ID="$(cat "$LAST_FILE" | tr -d "\r\n")"
+if [ -z "$OP_ID" ]; then
+  echo "No merge operation to undo."
+  exit 3
+fi
+
+OP_DIR="$UNDO_BASE/ops/$OP_ID"
+BACKUP_DIR="$OP_DIR/backup"
+CREATED_LIST="$OP_DIR/created.txt"
+RSYNC_LOG="$OP_DIR/rsync.log"
+
+if [ ! -d "$OP_DIR" ] || [ ! -d "$BACKUP_DIR" ]; then
+  echo "Undo data missing for last operation."
+  exit 4
+fi
+
+# Determine target directory used during merge by reading rsync log context.
+# We can’t reliably infer it later, so we store it if present.
+TARGET_FILE="$OP_DIR/target.txt"
+if [ ! -f "$TARGET_FILE" ]; then
+  echo "Undo target path missing."
+  exit 4
+fi
+TARGET="$(cat "$TARGET_FILE" | tr -d "\r\n")"
+if [ -z "$TARGET" ]; then
+  echo "Undo target path missing."
+  exit 4
+fi
+
+# 1) Restore overwritten/updated files from backup dir.
+rsync -a "$BACKUP_DIR"/ "$TARGET"/
+
+# 2) Remove files/dirs created by the merge.
+if [ -f "$CREATED_LIST" ]; then
+  # Delete files first, then directories (deepest-first).
+  while IFS= read -r rel; do
+    [ -z "$rel" ] && continue
+    rm -f "$TARGET/$rel" 2>/dev/null || true
+  done < "$CREATED_LIST"
+
+  # Now try removing any empty directories that were created.
+  tac "$CREATED_LIST" | while IFS= read -r rel; do
+    [ -z "$rel" ] && continue
+    rmdir "$TARGET/$rel" 2>/dev/null || true
+  done || true
+fi
+
+rm -f "$LAST_FILE"
+echo "OK"
+'`
+
+	// Run on the selected computer.
+	out, cmdErr := executeCommandStrictForComputer(*computer, undoCmd)
+	if cmdErr != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: strings.TrimSpace(out)})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]string{"computerId": req.ComputerID, "result": strings.TrimSpace(out)}})
+}
+
 // getComputerSystemInfo handles GET /api/system-info/:id
-// Collects host metrics via SSH and persists OS changes to DB.
+// Collects host metrics via local shell (for this server) or SSH.
 func getComputerSystemInfo(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 
@@ -891,7 +2045,7 @@ func getComputerSystemInfo(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{
 			Success: false,
-			Error:   fmt.Sprintf("Failed to collect system info via SSH: %v", err),
+			Error:   fmt.Sprintf("Failed to collect system info: %v", err),
 		})
 		log.Printf("ERROR: Failed to collect system info for %s@%s (%s): %v", computer.Username, computer.Place, computer.IP, err)
 		return
@@ -912,7 +2066,7 @@ func getComputerSystemInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 // getCPUOverview handles GET /api/cpu-overview/:id
-// Runs basic Linux commands and returns parsed CPU overview + raw command output.
+// Runs basic Linux commands and returns parsed CPU/RAM/storage/OS metrics.
 func getCPUOverview(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 
@@ -954,7 +2108,7 @@ func getCPUOverview(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{
 			Success: false,
-			Error:   fmt.Sprintf("Failed to collect CPU overview via SSH: %v", err),
+			Error:   fmt.Sprintf("Failed to collect CPU overview: %v", err),
 		})
 		log.Printf("ERROR: Failed to collect CPU overview for %s@%s (%s): %v", computer.Username, computer.Place, computer.IP, err)
 		return
@@ -983,6 +2137,87 @@ var upgrader = websocket.Upgrader{
 	},
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
+}
+
+// handleLocalTerminal bridges a WebSocket connection to a local shell PTY
+// running on the monitoring server itself (no SSH involved).
+func handleLocalTerminal(wsConn *websocket.Conn, computer *Computer) {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/bash"
+	}
+
+	cmd := exec.Command(shell)
+	cmd.Env = os.Environ()
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		cmd.Dir = home
+	}
+
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		log.Printf("ERROR: Failed to start local PTY shell: %v", err)
+		wsConn.WriteMessage(websocket.TextMessage, []byte("Failed to start local shell: "+err.Error()+"\r\n"))
+		return
+	}
+	defer func() {
+		_ = ptmx.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_, _ = cmd.Process.Wait()
+	}()
+
+	wsConn.WriteMessage(
+		websocket.TextMessage,
+		[]byte(fmt.Sprintf("Local shell established. Commands now run on %s@%s (server).\r\n\r\n", computer.Username, computer.IP)),
+	)
+
+	done := make(chan struct{})
+
+	// PTY → WebSocket
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := ptmx.Read(buf)
+			if n > 0 {
+				if writeErr := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); writeErr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		close(done)
+	}()
+
+	// WebSocket → PTY
+	for {
+		_, msg, err := wsConn.ReadMessage()
+		if err != nil {
+			break
+		}
+
+		// Handle terminal resize: {"type":"resize","cols":120,"rows":40}
+		if len(msg) > 0 && msg[0] == '{' {
+			var resizeMsg struct {
+				Type string `json:"type"`
+				Cols uint16 `json:"cols"`
+				Rows uint16 `json:"rows"`
+			}
+			if json.Unmarshal(msg, &resizeMsg) == nil && resizeMsg.Type == "resize" {
+				_ = pty.Setsize(ptmx, &pty.Winsize{Cols: resizeMsg.Cols, Rows: resizeMsg.Rows})
+				continue
+			}
+		}
+
+		if _, err := ptmx.Write(msg); err != nil {
+			break
+		}
+	}
+
+	<-done
+	log.Printf("INFO: Local WebSocket terminal closed for server user %s", computer.Username)
 }
 
 // handleTerminalWS handles GET /api/terminal/ws?computerId=xxx
@@ -1022,6 +2257,18 @@ func handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	defer wsConn.Close()
 
 	log.Printf("INFO: WebSocket terminal opened for %s@%s (%s)", computer.Username, computer.Place, computer.IP)
+
+	// If this entry represents the monitoring server itself, do NOT use SSH.
+	// Instead, attach the WebSocket directly to a local shell PTY so the server
+	// uses its own terminal while keeping the exact same frontend UI.
+	if isServerComputer(*computer) {
+		wsConn.WriteMessage(
+			websocket.TextMessage,
+			[]byte(fmt.Sprintf("Connecting to %s@%s (local server shell)...\r\n", computer.Username, computer.IP)),
+		)
+		handleLocalTerminal(wsConn, computer)
+		return
+	}
 
 	// Let the browser/user know which target we are trying to reach
 	wsConn.WriteMessage(
@@ -1198,6 +2445,14 @@ func router(w http.ResponseWriter, r *http.Request) {
 		executeTerminal(w, r)
 	case path == "/api/terminal/ws" && r.Method == http.MethodGet:
 		handleTerminalWS(w, r) // ✅ WebSocket route correctly placed here
+	case path == "/api/file-transfer/list" && r.Method == http.MethodGet:
+		listComputerFiles(w, r)
+	case path == "/api/file-transfer/download" && r.Method == http.MethodGet:
+		downloadComputerPath(w, r)
+	case path == "/api/file-transfer/copy" && r.Method == http.MethodPost:
+		copyComputerPath(w, r)
+	case path == "/api/file-transfer/undo" && r.Method == http.MethodPost:
+		undoLastMerge(w, r)
 	default:
 		http.FileServer(http.Dir("../frontend")).ServeHTTP(w, r)
 	}
