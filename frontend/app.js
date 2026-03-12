@@ -20,10 +20,83 @@ const API_BASE_URL = "http://localhost:8081/api";
 // ============================================================================
 
 let computers = [];
+const fileTransferState = {
+  sourceComputerId: "",
+  targetComputerId: "",
+  currentPath: "",
+  parentPath: "",
+  homePath: "",
+  roots: [],
+  entries: [],
+  selectedPath: "",
+};
 
 // ============================================================================
 // API Service Layer
 // ============================================================================
+
+const GENERIC_SERVER_RESPONSE_ERROR = "Invalid server response. Restart backend and try again.";
+
+async function parseJSONOrThrow(response, fallbackMessage = GENERIC_SERVER_RESPONSE_ERROR) {
+  const raw = await response.text();
+
+  // Helpful diagnostics in the browser console so we can see what
+  // the backend actually returned when parsing fails.
+  const debugPrefix = "[API] Unexpected response payload";
+
+  if (!raw || !raw.trim()) {
+    console.error(`${debugPrefix}: empty body`, {
+      status: response.status,
+      statusText: response.statusText,
+      url: response.url,
+    });
+    throw new Error("Server returned an empty response. Restart the backend and try again.");
+  }
+
+  let json;
+  try {
+    json = JSON.parse(raw);
+  } catch (error) {
+    const snippet = raw.slice(0, 200);
+    console.error(`${debugPrefix}: non‑JSON content`, {
+      status: response.status,
+      statusText: response.statusText,
+      url: response.url,
+      bodyPreview: snippet,
+    });
+
+    // If the backend accidentally served HTML or a static file (e.g. old binary),
+    // show a clearer message instead of the generic fallback.
+    if (/\<html[\s>]/i.test(snippet)) {
+      throw new Error(
+        "Backend returned HTML instead of JSON. Make sure you are running the latest Go backend on port 8081."
+      );
+    }
+
+    throw new Error(fallbackMessage);
+  }
+
+  // New: be tolerant of legacy backends that return bare data instead
+  // of the wrapped { success, data, error } structure.
+  if (!json || typeof json !== "object" || typeof json.success !== "boolean") {
+    console.warn(
+      `${debugPrefix}: JSON without expected { success, data, error } shape. Treating as success=true, data=json for backward compatibility.`,
+      {
+        status: response.status,
+        statusText: response.statusText,
+        url: response.url,
+        parsed: json,
+      }
+    );
+
+    return {
+      success: true,
+      data: json,
+    };
+  }
+
+  return json;
+}
 
 /**
  * Fetches all computers from the backend API
@@ -33,7 +106,7 @@ let computers = [];
 async function loadComputers() {
   try {
     const response = await fetch(`${API_BASE_URL}/computers`);
-    const json = await response.json();
+    const json = await parseJSONOrThrow(response);
     if (!json.success) throw new Error(json.error);
     return json.data;
   } catch (error) {
@@ -51,7 +124,7 @@ async function loadComputers() {
 async function pingOne(id) {
   try {
     const response = await fetch(`${API_BASE_URL}/ping/${id}`);
-    const json = await response.json();
+    const json = await parseJSONOrThrow(response);
     if (!json.success) throw new Error(json.error);
     return json.data;
   } catch (error) {
@@ -68,7 +141,7 @@ async function pingOne(id) {
 async function pingAll() {
   try {
     const response = await fetch(`${API_BASE_URL}/ping-all`);
-    const json = await response.json();
+    const json = await parseJSONOrThrow(response);
     if (!json.success) throw new Error(json.error);
     return json.data;
   } catch (error) {
@@ -90,13 +163,7 @@ async function runTerminalCommand(computerId, command) {
     body: JSON.stringify({ computerId, command }),
   });
 
-  const raw = await response.text();
-  let json;
-  try {
-    json = JSON.parse(raw);
-  } catch (parseError) {
-    throw new Error("Terminal API did not return JSON.");
-  }
+  const json = await parseJSONOrThrow(response);
 
   if (!json.success) {
     throw new Error(json.error || "Terminal command failed.");
@@ -105,19 +172,75 @@ async function runTerminalCommand(computerId, command) {
   return (json.data && json.data.output) || "";
 }
 
-function parseKeyValueLines(text) {
-  const map = {};
-  String(text || "")
-    .split(/\r?\n/)
-    .forEach((line) => {
-      const parts = line.split("=");
-      if (parts.length < 2) return;
-      const key = parts.shift().trim();
-      const value = parts.join("=").trim();
-      if (!key) return;
-      map[key] = value;
-    });
-  return map;
+async function listTransferFiles(computerId, path = "") {
+  const params = new URLSearchParams();
+  params.set("computerId", computerId);
+  if (path) params.set("path", path);
+
+  const response = await fetch(`${API_BASE_URL}/file-transfer/list?${params.toString()}`);
+  const json = await parseJSONOrThrow(response);
+  if (!json.success) throw new Error(json.error || "Failed to list files.");
+  return json.data;
+}
+
+async function downloadTransferPath(computerId, path) {
+  const params = new URLSearchParams();
+  params.set("computerId", computerId);
+  params.set("path", path);
+
+  const response = await fetch(`${API_BASE_URL}/file-transfer/download?${params.toString()}`);
+  if (!response.ok) {
+    let message = "Download failed.";
+    try {
+      const json = await response.json();
+      if (json && json.error) message = json.error;
+    } catch (error) {
+      // Ignore parse errors and keep fallback message.
+    }
+    throw new Error(message);
+  }
+
+  const disposition = response.headers.get("content-disposition") || "";
+  const match = disposition.match(/filename="?([^"]+)"?/i);
+  const filename = match ? match[1] : "download.bin";
+  const blob = await response.blob();
+  return { blob, filename };
+}
+
+async function copyTransferPath(
+  sourceComputerId,
+  sourcePath,
+  targetComputerId,
+  targetPath = "",
+  mode = "copy"
+) {
+  const response = await fetch(`${API_BASE_URL}/file-transfer/copy`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sourceComputerId,
+      sourcePath,
+      targetComputerId,
+      targetPath,
+      mode,
+    }),
+  });
+
+  const json = await parseJSONOrThrow(response);
+  if (!json.success) throw new Error(json.error || "Copy failed.");
+  return json.data;
+}
+
+async function undoLastMerge(computerId) {
+  const response = await fetch(`${API_BASE_URL}/file-transfer/undo`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ computerId }),
+  });
+
+  const json = await parseJSONOrThrow(response);
+  if (!json.success) throw new Error(json.error || "Undo failed.");
+  return json.data;
 }
 
 function toNumber(value) {
@@ -125,119 +248,175 @@ function toNumber(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
-function truncateText(value, maxLen = 6000) {
-  const str = String(value || "");
-  if (str.length <= maxLen) return str;
-  return `${str.slice(0, maxLen)}\n...truncated...`;
+function parseColonLines(text) {
+  const map = {};
+  String(text || "")
+    .split(/\r?\n/)
+    .forEach((line) => {
+      const idx = line.indexOf(":");
+      if (idx <= 0) return;
+      const key = line.slice(0, idx).trim();
+      const value = line.slice(idx + 1).trim();
+      if (!key) return;
+      map[key] = value;
+    });
+  return map;
+}
+
+function parseOsRelease(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  for (const line of lines) {
+    if (line.startsWith("PRETTY_NAME=")) {
+      return line.slice("PRETTY_NAME=".length).replace(/^"/, "").replace(/"$/, "").trim();
+    }
+  }
+  return "";
+}
+
+function parseSizeToBytes(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw === "-") return 0;
+  if (raw === "0" || raw === "0B") return 0;
+
+  const match = raw.match(/^([0-9]+(?:\.[0-9]+)?)\s*([kmgtp]?i?b?)?$/i);
+  if (!match) {
+    const plain = Number(raw);
+    return Number.isFinite(plain) ? plain : 0;
+  }
+
+  const num = Number(match[1]);
+  if (!Number.isFinite(num)) return 0;
+
+  const unit = (match[2] || "b").toLowerCase();
+  const powers = {
+    b: 0,
+    k: 1, kb: 1, kib: 1,
+    m: 2, mb: 2, mib: 2,
+    g: 3, gb: 3, gib: 3,
+    t: 4, tb: 4, tib: 4,
+    p: 5, pb: 5, pib: 5,
+  };
+  const power = powers[unit] ?? 0;
+  return num * (1024 ** power);
+}
+
+function parseFreeOutputToBytes(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const memLine = lines.find((line) => line.trim().startsWith("Mem:"));
+  if (!memLine) {
+    return { totalBytes: 0, usedBytes: 0, freeBytes: 0 };
+  }
+
+  const cols = memLine.trim().split(/\s+/);
+  if (cols.length < 4) {
+    return { totalBytes: 0, usedBytes: 0, freeBytes: 0 };
+  }
+
+  const totalBytes = parseSizeToBytes(cols[1]);
+  const usedBytes = parseSizeToBytes(cols[2]);
+  const freeBytes = parseSizeToBytes(cols[3]);
+  return { totalBytes, usedBytes, freeBytes };
+}
+
+function parseDFToBytes(text) {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const dataLine = lines[lines.length - 1] || "";
+  const cols = dataLine.split(/\s+/);
+  if (cols.length < 5) {
+    return { totalBytes: 0, usedBytes: 0, freeBytes: 0, usedPercent: 0 };
+  }
+
+  const totalBytes = parseSizeToBytes(cols[1]);
+  const usedBytes = parseSizeToBytes(cols[2]);
+  const freeBytes = parseSizeToBytes(cols[3]);
+  const usedPercent = toNumber(String(cols[4]).replace("%", ""));
+
+  return { totalBytes, usedBytes, freeBytes, usedPercent };
+}
+
+function parseLoadValues(text) {
+  const parts = String(text || "").trim().split(/\s+/);
+  return {
+    load1: toNumber(parts[0]),
+    load5: toNumber(parts[1]),
+    load15: toNumber(parts[2]),
+  };
+}
+
+function hasUsefulOverview(info) {
+  if (!info) return false;
+  if (toNumber(info.memoryTotalGB) > 0) return true;
+  if (toNumber(info.diskTotalGB) > 0) return true;
+  if (info.cpuModel && !String(info.cpuModel).toLowerCase().includes("unknown")) return true;
+  return false;
 }
 
 async function loadSystemInfoFallbackViaTerminal(computer) {
-  const summaryScript = `
-OS=$(awk -F= '/^PRETTY_NAME=/{gsub(/"/, "", $2); print $2}' /etc/os-release 2>/dev/null)
-if [ -z "$OS" ]; then OS=$(uname -s); fi
-CPU_MODEL=$(lscpu 2>/dev/null | awk -F: '/Model name/ {sub(/^[ \t]+/, "", $2); print $2; exit}')
-ARCH=$(lscpu 2>/dev/null | awk -F: '/Architecture/ {sub(/^[ \t]+/, "", $2); print $2; exit}')
-THREADS_PER_CORE=$(lscpu 2>/dev/null | awk -F: '/Thread\\(s\\) per core/ {sub(/^[ \t]+/, "", $2); print $2; exit}')
-SOCKETS=$(lscpu 2>/dev/null | awk -F: '/Socket\\(s\\)/ {sub(/^[ \t]+/, "", $2); print $2; exit}')
-CORES=$(nproc --all 2>/dev/null)
-if [ -z "$CORES" ]; then CORES=$(lscpu 2>/dev/null | awk -F: '/^CPU\\(s\\):/ {sub(/^[ \t]+/, "", $2); print $2; exit}'); fi
-LOAD1=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
-LOAD5=$(awk '{print $2}' /proc/loadavg 2>/dev/null)
-LOAD15=$(awk '{print $3}' /proc/loadavg 2>/dev/null)
-MEM_TOTAL_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null)
-MEM_AVAIL_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null)
-if [ -z "$MEM_AVAIL_KB" ]; then MEM_AVAIL_KB=$(awk '/MemFree/ {print $2}' /proc/meminfo 2>/dev/null); fi
-if [ -z "$MEM_TOTAL_KB" ]; then MEM_TOTAL_KB=0; fi
-if [ -z "$MEM_AVAIL_KB" ]; then MEM_AVAIL_KB=0; fi
-MEM_USED_KB=$((MEM_TOTAL_KB - MEM_AVAIL_KB))
-if [ "$MEM_USED_KB" -lt 0 ]; then MEM_USED_KB=0; fi
-DISK_TOTAL_KB=$(df -kP / 2>/dev/null | awk 'NR==2 {print $2}')
-DISK_USED_KB=$(df -kP / 2>/dev/null | awk 'NR==2 {print $3}')
-DISK_USED_PCT=$(df -kP / 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $5}')
-KERNEL=$(uname -r 2>/dev/null)
-UPTIME=$(uptime -p 2>/dev/null)
-if [ -z "$UPTIME" ]; then UPTIME=$(uptime 2>/dev/null); fi
-[ -z "$THREADS_PER_CORE" ] && THREADS_PER_CORE=0
-[ -z "$SOCKETS" ] && SOCKETS=0
-[ -z "$CORES" ] && CORES=0
-[ -z "$LOAD1" ] && LOAD1=0
-[ -z "$LOAD5" ] && LOAD5=0
-[ -z "$LOAD15" ] && LOAD15=0
-[ -z "$MEM_TOTAL_KB" ] && MEM_TOTAL_KB=0
-[ -z "$MEM_USED_KB" ] && MEM_USED_KB=0
-[ -z "$DISK_TOTAL_KB" ] && DISK_TOTAL_KB=0
-[ -z "$DISK_USED_KB" ] && DISK_USED_KB=0
-[ -z "$DISK_USED_PCT" ] && DISK_USED_PCT=0
-echo "OS=$OS"
-echo "CPU_MODEL=$CPU_MODEL"
-echo "ARCH=$ARCH"
-echo "THREADS_PER_CORE=$THREADS_PER_CORE"
-echo "SOCKETS=$SOCKETS"
-echo "CORES=$CORES"
-echo "LOAD1=$LOAD1"
-echo "LOAD5=$LOAD5"
-echo "LOAD15=$LOAD15"
-echo "MEM_TOTAL_KB=$MEM_TOTAL_KB"
-echo "MEM_USED_KB=$MEM_USED_KB"
-echo "DISK_TOTAL_KB=$DISK_TOTAL_KB"
-echo "DISK_USED_KB=$DISK_USED_KB"
-echo "DISK_USED_PCT=$DISK_USED_PCT"
-echo "KERNEL=$KERNEL"
-echo "UPTIME=$UPTIME"
-`;
-
-  const [summaryRaw, lscpuRaw, freeRaw, dmesgRaw] = await Promise.all([
-    runTerminalCommand(computer.id, `bash -lc ${JSON.stringify(summaryScript)}`),
+  const [
+    osReleaseRaw,
+    lscpuRaw,
+    freeRaw,
+    dfRaw,
+    loadRaw,
+    uptimeRaw,
+    kernelRaw,
+  ] = await Promise.all([
+    runTerminalCommand(computer.id, "cat /etc/os-release 2>/dev/null || uname -s"),
     runTerminalCommand(computer.id, "lscpu 2>&1"),
-    runTerminalCommand(computer.id, "free -h 2>&1"),
-    runTerminalCommand(computer.id, "dmesg 2>&1 | tail -n 25"),
+    runTerminalCommand(computer.id, "free -b 2>&1"),
+    runTerminalCommand(computer.id, "df -B1 / 2>&1 | tail -n 1"),
+    runTerminalCommand(computer.id, "awk '{print $1\" \"$2\" \"$3}' /proc/loadavg 2>/dev/null"),
+    runTerminalCommand(computer.id, "uptime -p 2>/dev/null || uptime 2>/dev/null"),
+    runTerminalCommand(computer.id, "uname -r 2>/dev/null"),
   ]);
 
-  const values = parseKeyValueLines(summaryRaw);
-  const kbPerGB = 1024 * 1024;
+  const osName = parseOsRelease(osReleaseRaw) || String(osReleaseRaw || "").trim() || computer.os || "Unknown Linux";
+  const lscpuMap = parseColonLines(lscpuRaw);
+  const { totalBytes: memTotalBytes, usedBytes: memUsedBytes } = parseFreeOutputToBytes(freeRaw);
+  const {
+    totalBytes: diskTotalBytes,
+    usedBytes: diskUsedBytes,
+    freeBytes: diskFreeBytes,
+    usedPercent: diskUsedPercent,
+  } = parseDFToBytes(dfRaw);
+  const { load1, load5, load15 } = parseLoadValues(loadRaw);
 
-  const coreCount = Math.max(1, Math.trunc(toNumber(values.CORES)));
-  const load1 = toNumber(values.LOAD1);
-  const load5 = toNumber(values.LOAD5);
-  const load15 = toNumber(values.LOAD15);
+  const coreCount = Math.max(1, Math.trunc(toNumber(lscpuMap["CPU(s)"])));
+  const threadsPerCore = Math.max(0, Math.trunc(toNumber(lscpuMap["Thread(s) per core"])));
+  const socketCount = Math.max(0, Math.trunc(toNumber(lscpuMap["Socket(s)"])));
   const cpuUsagePercent = clampPercent((load1 / coreCount) * 100);
-
-  const memoryTotalKB = toNumber(values.MEM_TOTAL_KB);
-  const memoryUsedKB = Math.min(memoryTotalKB, Math.max(0, toNumber(values.MEM_USED_KB)));
-  const memoryUsagePercent = memoryTotalKB > 0 ? (memoryUsedKB / memoryTotalKB) * 100 : 0;
-
-  const diskTotalKB = toNumber(values.DISK_TOTAL_KB);
-  const diskUsedKB = Math.min(diskTotalKB, Math.max(0, toNumber(values.DISK_USED_KB)));
-  const diskUsagePercent = toNumber(values.DISK_USED_PCT) || (diskTotalKB > 0 ? (diskUsedKB / diskTotalKB) * 100 : 0);
+  const memoryUsagePercent = memTotalBytes > 0 ? (memUsedBytes / memTotalBytes) * 100 : 0;
+  const diskUsagePercent = diskUsedPercent || (diskTotalBytes > 0 ? (diskUsedBytes / diskTotalBytes) * 100 : 0);
+  const bytesPerGB = 1024 ** 3;
 
   return {
     computerId: computer.id,
     place: computer.place,
     username: computer.username,
     ip: computer.ip,
-    os: values.OS || computer.os || "Unknown Linux",
-    kernel: values.KERNEL || "",
-    uptime: values.UPTIME || "",
-    architecture: values.ARCH || "",
-    cpuModel: values.CPU_MODEL || "",
+    os: osName,
+    kernel: String(kernelRaw || "").trim(),
+    uptime: String(uptimeRaw || "").trim(),
+    architecture: lscpuMap.Architecture || "",
+    cpuModel: lscpuMap["Model name"] || "",
     coreCount,
-    threadsPerCore: Math.max(0, Math.trunc(toNumber(values.THREADS_PER_CORE))),
-    socketCount: Math.max(0, Math.trunc(toNumber(values.SOCKETS))),
+    threadsPerCore,
+    socketCount,
     load1: roundTo(load1, 2),
     load5: roundTo(load5, 2),
     load15: roundTo(load15, 2),
     cpuUsagePercent: roundTo(cpuUsagePercent, 2),
-    memoryTotalGB: roundTo(memoryTotalKB / kbPerGB, 2),
-    memoryUsedGB: roundTo(memoryUsedKB / kbPerGB, 2),
+    memoryTotalGB: roundTo(memTotalBytes / bytesPerGB, 2),
+    memoryUsedGB: roundTo(memUsedBytes / bytesPerGB, 2),
     memoryUsagePercent: roundTo(memoryUsagePercent, 2),
-    diskTotalGB: roundTo(diskTotalKB / kbPerGB, 2),
-    diskUsedGB: roundTo(diskUsedKB / kbPerGB, 2),
+    diskTotalGB: roundTo(diskTotalBytes / bytesPerGB, 2),
+    diskUsedGB: roundTo(diskUsedBytes / bytesPerGB, 2),
+    diskFreeGB: roundTo(diskFreeBytes / bytesPerGB, 2),
     diskUsagePercent: roundTo(diskUsagePercent, 2),
-    commands: {
-      lscpu: truncateText(lscpuRaw),
-      free: truncateText(freeRaw),
-      dmesg: truncateText(dmesgRaw),
-    },
     collectedAt: new Date().toLocaleString(),
   };
 }
@@ -264,6 +443,9 @@ async function loadSystemInfo(computer) {
       return await loadSystemInfoFallbackViaTerminal(computer);
     }
     if (!json.success) throw new Error(json.error);
+    if (!hasUsefulOverview(json.data)) {
+      return await loadSystemInfoFallbackViaTerminal(computer);
+    }
     return json.data;
   } catch (error) {
     // If new endpoint is missing/invalid, fallback to terminal command strategy.
@@ -290,6 +472,7 @@ async function runCommandOnAllComputers(command) {
   }
 
   const runButton = document.getElementById("multi-terminal-run");
+  const runButtonOriginalHTML = runButton.innerHTML;
   runButton.disabled = true;
   runButton.textContent = "Running...";
 
@@ -314,7 +497,7 @@ async function runCommandOnAllComputers(command) {
             command: command,
           }),
         });
-        const json = await response.json();
+        const json = await parseJSONOrThrow(response);
         const header = `[${c.place} | ${c.id}]`;
         if (!json.success) {
           appendLine(`${header} ERROR: ${json.error || "Unknown error"}`, "multi-terminal__log-line--error");
@@ -338,7 +521,7 @@ async function runCommandOnAllComputers(command) {
     await Promise.all(tasks);
   } finally {
     runButton.disabled = false;
-    runButton.textContent = "";
+    runButton.innerHTML = runButtonOriginalHTML;
   }
 }
 
@@ -355,7 +538,7 @@ async function addComputer(computer) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(computer),
     });
-    const json = await response.json();
+    const json = await parseJSONOrThrow(response);
     if (!json.success) throw new Error(json.error);
     return json.data;
   } catch (error) {
@@ -378,7 +561,7 @@ async function updateComputer(id, computer) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(computer),
     });
-    const json = await response.json();
+    const json = await parseJSONOrThrow(response);
     if (!json.success) throw new Error(json.error);
     return json.data;
   } catch (error) {
@@ -399,7 +582,7 @@ async function deleteComputerAPI(id) {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
     });
-    const json = await response.json();
+    const json = await parseJSONOrThrow(response);
     if (!json.success) throw new Error(json.error);
     return json.data;
   } catch (error) {
@@ -451,11 +634,18 @@ function renderCard(computer, statusData = null) {
             <path d="M7 15l3-3 3 2 4-6"/>
           </svg>
         </button>
-        <button class="btn-terminal" data-id="${computer.id}" title="Open SSH terminal">
+        <button class="btn-terminal" data-id="${computer.id}" title="Open terminal">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" aria-hidden="true" focusable="false">
             <rect x="3" y="4" width="18" height="14" rx="2" ry="2"/>
             <polyline points="6 14 9 11 6 8"/>
             <line x1="11" y1="14" x2="18" y2="14"/>
+          </svg>
+        </button>
+        <button class="btn-transfer" data-id="${computer.id}" title="Browse files / transfer">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" aria-hidden="true" focusable="false">
+            <path d="M3 7h7l2 2h9v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+            <path d="M13 13h7"/>
+            <path d="M17 10l3 3-3 3"/>
           </svg>
         </button>
         <button class="btn-check" data-id="${computer.id}" title="Ping this computer">
@@ -501,6 +691,9 @@ function renderCard(computer, statusData = null) {
   document
     .querySelector(`#card-${computer.id} .btn-terminal`)
     .addEventListener("click", () => openTerminalModal(computer));
+  document
+    .querySelector(`#card-${computer.id} .btn-transfer`)
+    .addEventListener("click", () => openFileTransferModal(computer.id));
   document
     .querySelector(`#card-${computer.id} .btn-check`)
     .addEventListener("click", () => handlePingOne(computer.id));
@@ -738,6 +931,41 @@ function setSystemInfoMessage(text, isError = false) {
   messageEl.classList.toggle("system-info-page__message--error", isError);
 }
 
+async function generateSystemReport(info) {
+  const memoryTotalGB = Number(info.memoryTotalGB || 0);
+  const memoryUsedGB = Number(info.memoryUsedGB || 0);
+  const memoryFreeGB = Math.max(memoryTotalGB - memoryUsedGB, 0);
+
+  const diskTotalGB = Number(info.diskTotalGB || 0);
+  const diskUsedGB = Number(info.diskUsedGB || 0);
+  const diskFreeGB = Number.isFinite(Number(info.diskFreeGB))
+    ? Math.max(Number(info.diskFreeGB), 0)
+    : Math.max(diskTotalGB - diskUsedGB, 0);
+
+  const cpuPercent = clampPercent(info.cpuUsagePercent);
+  const ramPercent = clampPercent(info.memoryUsagePercent);
+  const storagePercent = clampPercent(info.diskUsagePercent);
+  const worstPercent = Math.max(cpuPercent, ramPercent, storagePercent);
+
+  let health = "Healthy";
+  if (worstPercent >= 90) {
+    health = "Critical";
+  } else if (worstPercent >= 75) {
+    health = "Warning";
+  }
+
+  return {
+    summary: `${info.place}: ${health} utilization profile based on CPU, RAM, and storage.`,
+    os: `${info.os || "Unknown OS"}${info.kernel ? ` (${info.kernel})` : ""}`,
+    cpu: `${info.cpuModel || "Unknown CPU"} | ${info.coreCount || 0} cores, ${info.threadsPerCore || 0} threads/core, ${info.socketCount || 0} socket(s), ${info.architecture || "Unknown arch"}`,
+    ram: `${formatGB(memoryUsedGB)} used, ${formatGB(memoryFreeGB)} free of ${formatGB(memoryTotalGB)} (${ramPercent.toFixed(1)}%)`,
+    storage: `${formatGB(diskUsedGB)} used, ${formatGB(diskFreeGB)} free of ${formatGB(diskTotalGB)} (${storagePercent.toFixed(1)}%)`,
+    health: `${health} | Load ${Number(info.load1 || 0).toFixed(2)} / ${Number(info.load5 || 0).toFixed(2)} / ${Number(info.load15 || 0).toFixed(2)} | Uptime: ${info.uptime || "-"}`,
+    memoryFreeGB,
+    diskFreeGB,
+  };
+}
+
 function renderSystemInfoLoading(computer) {
   document.getElementById("system-info-title").textContent = `CPU Overview - ${computer.place}`;
   document.getElementById("system-info-subtitle").textContent = `${computer.username}@${computer.ip}`;
@@ -751,16 +979,19 @@ function renderSystemInfoLoading(computer) {
   document.getElementById("system-cpu-text").textContent = "--";
   document.getElementById("system-memory-text").textContent = "-- / --";
   document.getElementById("system-disk-text").textContent = "-- / --";
-  document.getElementById("system-cmd-lscpu").textContent = "Running: lscpu ...";
-  document.getElementById("system-cmd-free").textContent = "Running: free -h ...";
-  document.getElementById("system-cmd-dmesg").textContent = "Running: dmesg ...";
+  document.getElementById("system-report-summary").textContent = "Analyzing host metrics...";
+  document.getElementById("system-report-os").textContent = "OS: ...";
+  document.getElementById("system-report-cpu").textContent = "CPU: ...";
+  document.getElementById("system-report-ram").textContent = "RAM: ...";
+  document.getElementById("system-report-storage").textContent = "Storage: ...";
+  document.getElementById("system-report-health").textContent = "Health: ...";
   setUsageBar("system-cpu-bar", 0);
   setUsageBar("system-memory-bar", 0);
   setUsageBar("system-disk-bar", 0);
   setSystemInfoMessage("Running SSH checks for CPU, RAM, storage, and OS...");
 }
 
-function renderSystemInfoData(info) {
+function renderSystemInfoData(info, report) {
   document.getElementById("system-info-title").textContent = `CPU Overview - ${info.place}`;
   document.getElementById("system-info-subtitle").textContent = `${info.username}@${info.ip}`;
   document.getElementById("system-info-os").textContent = info.os || "Unknown OS";
@@ -779,12 +1010,16 @@ function renderSystemInfoData(info) {
   document.getElementById("system-cpu-text").textContent =
     `Load: ${Number(info.load1 || 0).toFixed(2)} / ${Number(info.load5 || 0).toFixed(2)} / ${Number(info.load15 || 0).toFixed(2)}  |  Uptime: ${info.uptime || "-"}`;
   document.getElementById("system-memory-text").textContent =
-    `${formatGB(info.memoryUsedGB)} used of ${formatGB(info.memoryTotalGB)}`;
+    `${formatGB(info.memoryUsedGB)} used, ${formatGB(report.memoryFreeGB)} free of ${formatGB(info.memoryTotalGB)}`;
   document.getElementById("system-disk-text").textContent =
-    `${formatGB(info.diskUsedGB)} used of ${formatGB(info.diskTotalGB)}`;
-  document.getElementById("system-cmd-lscpu").textContent = (info.commands && info.commands.lscpu) || "No lscpu output";
-  document.getElementById("system-cmd-free").textContent = (info.commands && info.commands.free) || "No free -h output";
-  document.getElementById("system-cmd-dmesg").textContent = (info.commands && info.commands.dmesg) || "No dmesg output";
+    `${formatGB(info.diskUsedGB)} used, ${formatGB(report.diskFreeGB)} free of ${formatGB(info.diskTotalGB)}`;
+
+  document.getElementById("system-report-summary").textContent = report.summary;
+  document.getElementById("system-report-os").textContent = `OS: ${report.os}`;
+  document.getElementById("system-report-cpu").textContent = `CPU: ${report.cpu}`;
+  document.getElementById("system-report-ram").textContent = `RAM: ${report.ram}`;
+  document.getElementById("system-report-storage").textContent = `Storage: ${report.storage}`;
+  document.getElementById("system-report-health").textContent = `Health: ${report.health}`;
 
   setUsageBar("system-cpu-bar", cpuPercent);
   setUsageBar("system-memory-bar", memoryPercent);
@@ -794,6 +1029,8 @@ function renderSystemInfoData(info) {
 
 function renderSystemInfoError(errorMessage) {
   setSystemInfoMessage(errorMessage || "Failed to load system info.", true);
+  document.getElementById("system-report-summary").textContent = "Report generation failed.";
+  document.getElementById("system-report-health").textContent = "Health: unavailable";
 }
 
 function openSystemInfoPage(computer) {
@@ -823,7 +1060,8 @@ async function handleOpenSystemInfo(id) {
 
   try {
     const info = await loadSystemInfo(computer);
-    renderSystemInfoData(info);
+    const report = await generateSystemReport(info);
+    renderSystemInfoData(info, report);
 
     const target = computers.find((c) => c.id === id);
     if (target) {
@@ -990,7 +1228,7 @@ function initPlainTerminal(computer, container) {
     container.scrollTop = container.scrollHeight;
   };
 
-  appendLine(`Connecting to ${computer.username}@${computer.ip} via SSH...`);
+  appendLine(`Connecting to ${computer.username}@${computer.ip}...`);
   statusEl.textContent = "Connecting...";
 
   const wsURL = `ws://localhost:8081/api/terminal/ws?computerId=${encodeURIComponent(computer.id)}`;
@@ -1130,6 +1368,331 @@ function closeTerminalModal() {
   if (terminalInstance) { terminalInstance.dispose(); terminalInstance = null; }
   currentTerminalComputer = null;
 }
+
+// ============================================================================
+// File Transfer Modal
+// ============================================================================
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let idx = 0;
+  let size = bytes;
+  while (size >= 1024 && idx < units.length - 1) {
+    size /= 1024;
+    idx += 1;
+  }
+  return `${size.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`;
+}
+
+function getComputerLabelById(id) {
+  const computer = computers.find((c) => c.id === id);
+  if (!computer) return id || "Unknown";
+  return `${computer.place} (${computer.username}@${computer.ip})`;
+}
+
+function renderFileTransferRoots() {
+  const rootsEl = document.getElementById("file-transfer-roots");
+  if (!rootsEl) return;
+
+  const roots = Array.isArray(fileTransferState.roots) ? fileTransferState.roots : [];
+  rootsEl.innerHTML = "";
+
+  roots.forEach((root) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "file-transfer__root-btn";
+    if (!root.exists) button.classList.add("file-transfer__root-btn--disabled");
+    if (root.path === fileTransferState.currentPath) button.classList.add("file-transfer__root-btn--active");
+    button.textContent = root.label;
+    button.disabled = !root.exists;
+    button.addEventListener("click", () => refreshFileTransferList(root.path));
+    rootsEl.appendChild(button);
+  });
+}
+
+function selectFileTransferPath(path) {
+  fileTransferState.selectedPath = String(path || "").trim();
+  const selectedEl = document.getElementById("file-transfer-selected");
+  if (!selectedEl) return;
+  selectedEl.textContent = fileTransferState.selectedPath || "None";
+}
+
+function renderFileTransferEntries() {
+  const listEl = document.getElementById("file-transfer-list");
+  if (!listEl) return;
+
+  const entries = Array.isArray(fileTransferState.entries) ? fileTransferState.entries : [];
+  if (entries.length === 0) {
+    listEl.innerHTML = `<p class="file-transfer__empty">No files or folders found in this directory.</p>`;
+    return;
+  }
+
+  listEl.innerHTML = "";
+  entries.forEach((entry) => {
+    const row = document.createElement("div");
+    row.className = "file-transfer__entry";
+
+    const nameButton = document.createElement("button");
+    nameButton.type = "button";
+    nameButton.className = "file-transfer__entry-main";
+    nameButton.innerHTML = `
+      <span class="file-transfer__entry-kind">${entry.isDir ? "DIR" : "FILE"}</span>
+      <span class="file-transfer__entry-name">${escapeHTML(entry.name)}</span>
+      <span class="file-transfer__entry-meta">${entry.isDir ? "Folder" : formatBytes(entry.sizeBytes)} • ${escapeHTML(entry.modifiedAt || "-")}</span>
+    `;
+    if (entry.isDir) {
+      nameButton.addEventListener("click", () => refreshFileTransferList(entry.path));
+    } else {
+      nameButton.addEventListener("click", () => selectFileTransferPath(entry.path));
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "file-transfer__entry-actions";
+
+    if (entry.isDir) {
+      const openButton = document.createElement("button");
+      openButton.type = "button";
+      openButton.className = "file-transfer__mini-btn";
+      openButton.textContent = "Open";
+      openButton.addEventListener("click", () => refreshFileTransferList(entry.path));
+      actions.appendChild(openButton);
+    }
+
+    const selectButton = document.createElement("button");
+    selectButton.type = "button";
+    selectButton.className = "file-transfer__mini-btn file-transfer__mini-btn--select";
+    if (entry.path === fileTransferState.selectedPath) {
+      selectButton.classList.add("file-transfer__mini-btn--active");
+    }
+    selectButton.textContent = "Select";
+    selectButton.addEventListener("click", () => {
+      selectFileTransferPath(entry.path);
+      renderFileTransferEntries();
+    });
+    actions.appendChild(selectButton);
+
+    row.appendChild(nameButton);
+    row.appendChild(actions);
+    listEl.appendChild(row);
+  });
+}
+
+async function refreshFileTransferList(path = "") {
+  const sourceId = fileTransferState.sourceComputerId;
+  if (!sourceId) return;
+
+  const listEl = document.getElementById("file-transfer-list");
+  if (listEl) {
+    listEl.innerHTML = `<p class="file-transfer__loading">Loading files from ${escapeHTML(getComputerLabelById(sourceId))}...</p>`;
+  }
+
+  try {
+    const data = await listTransferFiles(sourceId, path);
+    fileTransferState.currentPath = data.currentPath || "";
+    fileTransferState.parentPath = data.parentPath || "";
+    fileTransferState.homePath = data.homePath || "";
+    fileTransferState.roots = Array.isArray(data.roots) ? data.roots : [];
+    fileTransferState.entries = Array.isArray(data.entries) ? data.entries : [];
+
+    if (fileTransferState.selectedPath && !fileTransferState.selectedPath.startsWith(fileTransferState.homePath)) {
+      fileTransferState.selectedPath = "";
+    }
+
+    const pathEl = document.getElementById("file-transfer-path");
+    if (pathEl) pathEl.textContent = fileTransferState.currentPath || "-";
+
+    const upButton = document.getElementById("file-transfer-up");
+    if (upButton) upButton.disabled = !fileTransferState.parentPath;
+
+    renderFileTransferRoots();
+    renderFileTransferEntries();
+    selectFileTransferPath(fileTransferState.selectedPath);
+  } catch (error) {
+    if (listEl) {
+      listEl.innerHTML = `<p class="file-transfer__error">${escapeHTML(error.message || "Failed to load files.")}</p>`;
+    }
+    showToast(`File list error: ${error.message}`, "error");
+  }
+}
+
+function populateFileTransferComputers(initialSourceId = "") {
+  const sourceSelect = document.getElementById("file-transfer-source");
+  const targetSelect = document.getElementById("file-transfer-target");
+  if (!sourceSelect || !targetSelect) return;
+
+  const sourceId = initialSourceId || computers[0]?.id || "";
+  const targetFallback = computers.find((c) => c.id !== sourceId)?.id || sourceId;
+
+  sourceSelect.innerHTML = "";
+  targetSelect.innerHTML = "";
+
+  computers.forEach((computer) => {
+    const sourceOption = document.createElement("option");
+    sourceOption.value = computer.id;
+    sourceOption.textContent = `${computer.place} (${computer.username}@${computer.ip})`;
+    sourceSelect.appendChild(sourceOption);
+
+    const targetOption = document.createElement("option");
+    targetOption.value = computer.id;
+    targetOption.textContent = `${computer.place} (${computer.username}@${computer.ip})`;
+    targetSelect.appendChild(targetOption);
+  });
+
+  sourceSelect.value = sourceId;
+  targetSelect.value = targetFallback;
+  fileTransferState.sourceComputerId = sourceSelect.value;
+  fileTransferState.targetComputerId = targetSelect.value;
+}
+
+function openFileTransferModal(initialSourceId = "") {
+  if (computers.length === 0) {
+    showToast("No computers configured.", "error");
+    return;
+  }
+
+  populateFileTransferComputers(initialSourceId);
+  fileTransferState.selectedPath = "";
+  selectFileTransferPath("");
+
+  document.getElementById("file-transfer-modal").classList.add("modal--open");
+  refreshFileTransferList("");
+}
+
+function closeFileTransferModal() {
+  document.getElementById("file-transfer-modal").classList.remove("modal--open");
+}
+
+async function handleFileTransferDownload() {
+  if (!fileTransferState.sourceComputerId || !fileTransferState.selectedPath) {
+    showToast("Select a file or folder first.", "error");
+    return;
+  }
+
+  const button = document.getElementById("file-transfer-download");
+  button.disabled = true;
+  const previousLabel = button.textContent;
+  button.textContent = "Downloading...";
+
+  try {
+    const { blob, filename } = await downloadTransferPath(
+      fileTransferState.sourceComputerId,
+      fileTransferState.selectedPath
+    );
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename || "download.bin";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+
+    showToast("Download started.", "success");
+  } catch (error) {
+    showToast(`Download failed: ${error.message}`, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = previousLabel;
+  }
+}
+
+async function handleFileTransferCopy() {
+  const sourceId = fileTransferState.sourceComputerId;
+  const targetId = document.getElementById("file-transfer-target")?.value || "";
+  const selectedPath = fileTransferState.selectedPath;
+
+  if (!sourceId || !targetId || !selectedPath) {
+    showToast("Select source file/folder and target computer first.", "error");
+    return;
+  }
+
+  if (sourceId === targetId) {
+    showToast("Choose a different target computer for paste.", "error");
+    return;
+  }
+
+  const button = document.getElementById("file-transfer-copy");
+  button.disabled = true;
+  const previousLabel = button.textContent;
+  button.textContent = "Pasting...";
+
+  try {
+    await copyTransferPath(sourceId, selectedPath, targetId, "", "copy");
+    showToast(`Pasted to ${getComputerLabelById(targetId)} (Downloads/Home).`, "success");
+  } catch (error) {
+    showToast(`Paste failed: ${error.message}`, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = previousLabel;
+  }
+}
+
+async function handleFileTransferMerge() {
+  const sourceId = fileTransferState.sourceComputerId;
+  const targetId = document.getElementById("file-transfer-target")?.value || "";
+  const selectedPath = fileTransferState.selectedPath;
+
+  if (!sourceId || !targetId || !selectedPath) {
+    showToast("Select source folder and target computer first.", "error");
+    return;
+  }
+
+  if (sourceId === targetId) {
+    showToast("Choose a different target computer for merge.", "error");
+    return;
+  }
+
+  // Ensure the selected path is a directory before attempting merge.
+  const entries = Array.isArray(fileTransferState.entries) ? fileTransferState.entries : [];
+  const entry = entries.find((e) => e.path === selectedPath);
+  if (!entry || !entry.isDir) {
+    showToast("Merge is only supported for folders. Please select a folder.", "error");
+    return;
+  }
+
+  const button = document.getElementById("file-transfer-merge");
+  button.disabled = true;
+  const previousLabel = button.textContent;
+  button.textContent = "Merging...";
+
+  try {
+    await copyTransferPath(sourceId, selectedPath, targetId, "", "merge_newer");
+    showToast(
+      `Merged folder into ${getComputerLabelById(targetId)} (Downloads/Home).`,
+      "success"
+    );
+  } catch (error) {
+    showToast(`Merge failed: ${error.message}`, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = previousLabel;
+  }
+}
+
+async function handleFileTransferUndo() {
+  const targetId = document.getElementById("file-transfer-target")?.value || "";
+  if (!targetId) {
+    showToast("Select a target computer to undo the last merge.", "error");
+    return;
+  }
+
+  const button = document.getElementById("file-transfer-undo");
+  button.disabled = true;
+  const previousLabel = button.textContent;
+  button.textContent = "Undoing...";
+
+  try {
+    await undoLastMerge(targetId);
+    showToast(`Undo complete on ${getComputerLabelById(targetId)}.`, "success");
+  } catch (error) {
+    showToast(`Undo failed: ${error.message}`, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = previousLabel;
+  }
+}
 // ============================================================================
 // Modal Management
 // ============================================================================
@@ -1198,6 +1761,7 @@ async function init() {
 function setupEventListeners() {
   document.getElementById("btn-ping-all").addEventListener("click", handlePingAll);
   document.getElementById("btn-add").addEventListener("click", openModal);
+  document.getElementById("btn-file-transfer").addEventListener("click", () => openFileTransferModal());
   document.getElementById("btn-terminal-all").addEventListener("click", () => {
     document.getElementById("multi-terminal-modal").classList.add("modal--open");
     document.getElementById("multi-terminal-command").focus();
@@ -1237,6 +1801,36 @@ function setupEventListeners() {
       runCommandOnAllComputers(e.target.value);
     }
   });
+
+  // File transfer modal listeners
+  document.getElementById("file-transfer-close").addEventListener("click", closeFileTransferModal);
+  document.getElementById("file-transfer-modal").addEventListener("click", (e) => {
+    if (e.target.id === "file-transfer-modal") closeFileTransferModal();
+  });
+  document.getElementById("file-transfer-source").addEventListener("change", (e) => {
+    fileTransferState.sourceComputerId = e.target.value;
+    const targetSelect = document.getElementById("file-transfer-target");
+    if (targetSelect && targetSelect.value === fileTransferState.sourceComputerId) {
+      const fallback = computers.find((c) => c.id !== fileTransferState.sourceComputerId);
+      if (fallback) {
+        targetSelect.value = fallback.id;
+      }
+    }
+    fileTransferState.selectedPath = "";
+    selectFileTransferPath("");
+    refreshFileTransferList("");
+  });
+  document.getElementById("file-transfer-target").addEventListener("change", (e) => {
+    fileTransferState.targetComputerId = e.target.value;
+  });
+  document.getElementById("file-transfer-up").addEventListener("click", () => {
+    if (!fileTransferState.parentPath) return;
+    refreshFileTransferList(fileTransferState.parentPath);
+  });
+  document.getElementById("file-transfer-download").addEventListener("click", handleFileTransferDownload);
+  document.getElementById("file-transfer-copy").addEventListener("click", handleFileTransferCopy);
+  document.getElementById("file-transfer-merge").addEventListener("click", handleFileTransferMerge);
+  document.getElementById("file-transfer-undo").addEventListener("click", handleFileTransferUndo);
 
   // Terminal modal listeners
   document.getElementById("terminal-modal-close").addEventListener("click", closeTerminalModal);
@@ -1297,6 +1891,10 @@ function setupEventListeners() {
       }
       if (document.getElementById("system-info-page").classList.contains("active")) {
         closeSystemInfoPage();
+        return;
+      }
+      if (document.getElementById("file-transfer-modal").classList.contains("modal--open")) {
+        closeFileTransferModal();
       }
     }
   });

@@ -12,9 +12,9 @@ echo -e "${BLUE}  Network Monitoring Terminal - Quick Start${NC}"
 echo -e "${BLUE}================================================${NC}"
 echo ""
 
-# Check if backend binary exists
-if [ ! -f "./backend/server" ]; then
-    echo -e "${YELLOW}⚠️  Backend binary not found. Building now...${NC}"
+# Rebuild backend if binary is missing or source changed
+if [ ! -f "./backend/server" ] || [ "./backend/main.go" -nt "./backend/server" ] || [ "./backend/database.go" -nt "./backend/server" ]; then
+    echo -e "${YELLOW}⚠️  Backend binary missing/outdated. Building now...${NC}"
     cd backend
     go build -o server main.go database.go
     if [ $? -eq 0 ]; then

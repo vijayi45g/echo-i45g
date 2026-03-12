@@ -19,6 +19,7 @@
         <button id="btn-add" class="btn btn--primary">+ Add Computer</button>
         <button id="btn-ping-all" class="btn btn--outline">Check All</button>
         <button id="btn-terminal-all" class="btn btn--outline">Run Command on All</button>
+        <button id="btn-file-transfer" class="btn btn--outline">File Transfer</button>
       </div>
     </header>
 
@@ -199,6 +200,53 @@
     </div>
 
     <!-- ============================================================================ -->
+    <!-- File Transfer Modal -->
+    <!-- ============================================================================ -->
+    <div id="file-transfer-modal" class="modal">
+      <div class="modal__box file-transfer__box">
+        <div class="modal__header">
+          <h2>File Transfer</h2>
+          <button id="file-transfer-close" class="modal__close">✕</button>
+        </div>
+
+        <div class="file-transfer__selectors">
+          <div class="form__group">
+            <label for="file-transfer-source">Source Computer</label>
+            <select id="file-transfer-source" class="file-transfer__select"></select>
+          </div>
+          <div class="form__group">
+            <label for="file-transfer-target">Paste Target Computer</label>
+            <select id="file-transfer-target" class="file-transfer__select"></select>
+          </div>
+        </div>
+
+        <div class="file-transfer__nav">
+          <button id="file-transfer-up" class="btn btn--outline btn--icon" type="button">↑</button>
+          <code id="file-transfer-path">-</code>
+        </div>
+
+        <div id="file-transfer-roots" class="file-transfer__roots"></div>
+        <div id="file-transfer-list" class="file-transfer__list"></div>
+        <p class="file-transfer__selected">Selected: <span id="file-transfer-selected">None</span></p>
+
+        <div class="file-transfer__actions">
+          <button id="file-transfer-download" class="btn btn--primary" type="button">
+            Download Selected (File or Folder)
+          </button>
+          <button id="file-transfer-copy" class="btn btn--outline" type="button">
+            Copy / Paste Selected
+          </button>
+          <button id="file-transfer-merge" class="btn btn--outline" type="button">
+            Merge Folder (Overwrite If Newer)
+          </button>
+          <button id="file-transfer-undo" class="btn btn--outline" type="button">
+            Undo Last Merge (Target Computer)
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================================================ -->
     <!-- System Info Full-Page View -->
     <!-- ============================================================================ -->
     <div id="system-info-page" class="system-info-page">
@@ -266,22 +314,17 @@
           </article>
         </div>
 
-        <div class="system-command-grid">
-          <article class="system-command-card">
-            <h3>lscpu</h3>
-            <pre id="system-cmd-lscpu">-</pre>
-          </article>
-
-          <article class="system-command-card">
-            <h3>free -h</h3>
-            <pre id="system-cmd-free">-</pre>
-          </article>
-
-          <article class="system-command-card">
-            <h3>dmesg (tail)</h3>
-            <pre id="system-cmd-dmesg">-</pre>
-          </article>
-        </div>
+        <article class="system-report-card">
+          <h3>System Report</h3>
+          <p id="system-report-summary" class="system-report-card__summary">Analyzing host metrics...</p>
+          <ul class="system-report-list">
+            <li id="system-report-os">OS: -</li>
+            <li id="system-report-cpu">CPU: -</li>
+            <li id="system-report-ram">RAM: -</li>
+            <li id="system-report-storage">Storage: -</li>
+            <li id="system-report-health">Health: -</li>
+          </ul>
+        </article>
       </div>
     </div>
 
