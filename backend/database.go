@@ -76,12 +76,6 @@ func createTables() error {
 		UNIQUE(target_machine_id, target_folder, relative_path)
 	);
 
-	CREATE TABLE IF NOT EXISTS mac_addresses (
-		computer_id   TEXT PRIMARY KEY,
-		mac_address   TEXT NOT NULL,
-		discovered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		FOREIGN KEY (computer_id) REFERENCES computers(id) ON DELETE CASCADE
-	);
 
 	CREATE TABLE IF NOT EXISTS health_status (
 		computer_id  TEXT PRIMARY KEY,
@@ -376,42 +370,6 @@ func deleteComputer(id string) error {
 
 	log.Printf("INFO: Computer deleted - ID: %s", id)
 	return nil
-}
-
-// ============================================================================
-// MAC Address Database Operations (internal – never exposed via API)
-// ============================================================================
-
-// upsertMacAddress stores or updates the MAC address for a computer.
-func upsertMacAddress(computerID, mac string) error {
-	_, err := db.Exec(
-		`INSERT INTO mac_addresses (computer_id, mac_address, discovered_at)
-		 VALUES (?, ?, CURRENT_TIMESTAMP)
-		 ON CONFLICT(computer_id)
-		 DO UPDATE SET mac_address = excluded.mac_address, discovered_at = CURRENT_TIMESTAMP`,
-		computerID, mac,
-	)
-	if err != nil {
-		log.Printf("ERROR: Failed to upsert MAC for %s: %v", computerID, err)
-	}
-	return err
-}
-
-// getMacAddress returns the stored MAC address for a computer, or "" if unknown.
-func getMacAddress(computerID string) (string, error) {
-	var mac string
-	err := db.QueryRow(
-		`SELECT mac_address FROM mac_addresses WHERE computer_id = ?`, computerID,
-	).Scan(&mac)
-	if err != nil {
-		return "", err
-	}
-	return mac, nil
-}
-
-// deleteMacAddress removes the MAC record when a computer is deleted.
-func deleteMacAddress(computerID string) {
-	_, _ = db.Exec(`DELETE FROM mac_addresses WHERE computer_id = ?`, computerID)
 }
 
 // ============================================================================

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,7 +15,6 @@ import (
 	"os/user"
 	pathpkg "path"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -183,9 +181,6 @@ func addComputer(w http.ResponseWriter, r *http.Request) {
 		Success: true,
 		Data:    c,
 	})
-
-	// Trigger background MAC discovery for the new computer
-	discoverMacForComputer(c)
 
 	log.Printf("INFO: Computer added to database - ID: %s, Place: %s, Username: %s, IP: %s", c.ID, c.Place, c.Username, c.IP)
 }
@@ -366,9 +361,7 @@ func deleteComputerHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("WARNING: Attempt to delete non-existent computer ID: %s", id)
 		return
 	}
-
-	// Clean up associated MAC and health records
-	deleteMacAddress(id)
+	// Clean up associated health records
 	deleteHealthStatus(id)
 
 	writeJSON(w, http.StatusOK, APIResponse{
@@ -2620,200 +2613,7 @@ func handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	log.Printf("INFO: WebSocket terminal closed for %s@%s", computer.Username, computer.Place)
 }
 
-// ============================================================================
-// MAC Address Discovery (internal – never exposed to frontend)
-// ============================================================================
 
-var macRegexp = regexp.MustCompile(`([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}`)
-
-// discoverMacAddress attempts to discover the MAC address of a host via ARP.
-// It first pings the host to populate the ARP cache, then reads from arp/ip neigh.
-func discoverMacAddress(ip string) (string, error) {
-	// Ping the host to populate ARP cache (ignore errors – we just need the side-effect)
-	exec.Command("ping", "-c", "1", "-W", "1", ip).Run()
-
-	// Try 'ip neigh show' first (modern Linux)
-	out, err := exec.Command("ip", "neigh", "show", ip).Output()
-	if err == nil {
-		if mac := macRegexp.FindString(string(out)); mac != "" {
-			return strings.ToLower(mac), nil
-		}
-	}
-
-	// Fallback to 'arp -n'
-	out, err = exec.Command("arp", "-n", ip).Output()
-	if err == nil {
-		if mac := macRegexp.FindString(string(out)); mac != "" {
-			return strings.ToLower(mac), nil
-		}
-	}
-
-	return "", fmt.Errorf("could not discover MAC for %s", ip)
-}
-
-// discoverAllMacAddresses runs MAC discovery for all registered computers.
-// Called as a background goroutine on server startup.
-func discoverAllMacAddresses() {
-	computers, err := getComputers()
-	if err != nil {
-		log.Printf("WARNING: MAC discovery failed to load computers: %v", err)
-		return
-	}
-
-	log.Printf("INFO: Starting MAC address discovery for %d computers...", len(computers))
-
-	var wg sync.WaitGroup
-	for _, c := range computers {
-		// Skip localhost/server entries – they don't need WOL
-		if isServerComputer(c) {
-			continue
-		}
-
-		wg.Add(1)
-		go func(comp Computer) {
-			defer wg.Done()
-			mac, err := discoverMacAddress(comp.IP)
-			if err != nil {
-				log.Printf("WARNING: MAC discovery failed for %s (%s): %v", comp.Place, comp.IP, err)
-				return
-			}
-			if err := upsertMacAddress(comp.ID, mac); err != nil {
-				log.Printf("ERROR: Failed to store MAC for %s: %v", comp.ID, err)
-				return
-			}
-			log.Printf("INFO: Discovered MAC for %s (%s): %s", comp.Place, comp.IP, mac)
-		}(c)
-	}
-	wg.Wait()
-	log.Println("INFO: MAC address discovery complete")
-}
-
-// discoverMacForComputer discovers and stores the MAC for a single computer.
-// Used when a new computer is added.
-func discoverMacForComputer(c Computer) {
-	if isServerComputer(c) {
-		return
-	}
-	go func() {
-		mac, err := discoverMacAddress(c.IP)
-		if err != nil {
-			log.Printf("WARNING: MAC discovery failed for new computer %s (%s): %v", c.Place, c.IP, err)
-			return
-		}
-		if err := upsertMacAddress(c.ID, mac); err != nil {
-			log.Printf("ERROR: Failed to store MAC for %s: %v", c.ID, err)
-			return
-		}
-		log.Printf("INFO: Discovered MAC for new computer %s (%s): %s", c.Place, c.IP, mac)
-	}()
-}
-
-// ============================================================================
-// Wake-on-LAN
-// ============================================================================
-
-// sendWakeOnLAN constructs and sends a WOL magic packet to the broadcast address.
-func sendWakeOnLAN(macAddr string) error {
-	// Normalize MAC address separators
-	macAddr = strings.ReplaceAll(macAddr, "-", ":")
-	parts := strings.Split(macAddr, ":")
-	if len(parts) != 6 {
-		return fmt.Errorf("invalid MAC address: %s", macAddr)
-	}
-
-	var hwAddr [6]byte
-	for i, p := range parts {
-		val, err := strconv.ParseUint(p, 16, 8)
-		if err != nil {
-			return fmt.Errorf("invalid MAC byte %q: %w", p, err)
-		}
-		hwAddr[i] = byte(val)
-	}
-
-	// Build magic packet: 6 bytes of 0xFF + 16 repetitions of the MAC address
-	var buf bytes.Buffer
-	// 6 × 0xFF header
-	for i := 0; i < 6; i++ {
-		buf.WriteByte(0xFF)
-	}
-	// 16 × MAC address
-	for i := 0; i < 16; i++ {
-		binary.Write(&buf, binary.BigEndian, hwAddr)
-	}
-
-	// Send via UDP broadcast on port 9
-	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{
-		IP:   net.IPv4bcast,
-		Port: 9,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to open UDP socket: %w", err)
-	}
-	defer conn.Close()
-
-	_, err = conn.Write(buf.Bytes())
-	if err != nil {
-		return fmt.Errorf("failed to send magic packet: %w", err)
-	}
-
-	log.Printf("INFO: WOL magic packet sent to %s", macAddr)
-	return nil
-}
-
-// handleWakeComputer handles POST /api/wake/:id
-func handleWakeComputer(w http.ResponseWriter, r *http.Request) {
-	setCORS(w)
-
-	id := strings.TrimPrefix(r.URL.Path, "/api/wake/")
-	if id == "" {
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Error:   "Missing computer ID",
-		})
-		return
-	}
-
-	computer, err := getComputerByID(id)
-	if err != nil || computer == nil {
-		writeJSON(w, http.StatusNotFound, APIResponse{
-			Success: false,
-			Error:   "Computer not found",
-		})
-		return
-	}
-
-	mac, err := getMacAddress(id)
-	if err != nil || mac == "" {
-		// Try to discover MAC on the fly
-		mac, err = discoverMacAddress(computer.IP)
-		if err != nil || mac == "" {
-			writeJSON(w, http.StatusNotFound, APIResponse{
-				Success: false,
-				Error:   "MAC address not found. The computer must be online at least once for MAC discovery.",
-			})
-			return
-		}
-		// Store the discovered MAC for future use
-		_ = upsertMacAddress(id, mac)
-	}
-
-	if err := sendWakeOnLAN(mac); err != nil {
-		writeJSON(w, http.StatusInternalServerError, APIResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to send WOL packet: %v", err),
-		})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, APIResponse{
-		Success: true,
-		Data: map[string]string{
-			"id":      id,
-			"message": fmt.Sprintf("Wake-on-LAN packet sent to %s (%s)", computer.Place, computer.IP),
-		},
-	})
-	log.Printf("INFO: WOL packet sent for %s (%s) via MAC %s", computer.Place, computer.IP, mac)
-}
 
 // ============================================================================
 // Periodic Health Check
@@ -2944,8 +2744,6 @@ func router(w http.ResponseWriter, r *http.Request) {
 		unmergeComputerPath(w, r)
 	case path == "/api/file-transfer/merge-history" && r.Method == http.MethodGet:
 		getMergeHistoryHandler(w, r)
-	case strings.HasPrefix(path, "/api/wake/") && r.Method == http.MethodPost:
-		handleWakeComputer(w, r)
 	case path == "/api/health-status" && r.Method == http.MethodGet:
 		handleGetHealthStatus(w, r)
 	default:
@@ -2963,9 +2761,6 @@ func main() {
 		log.Fatalf("FATAL: Failed to initialize database: %v", err)
 	}
 	defer closeDatabase()
-
-	// Start background MAC address discovery
-	go discoverAllMacAddresses()
 
 	// Start background health check loop (pings all computers every 60s)
 	go healthCheckLoop()

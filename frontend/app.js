@@ -592,26 +592,6 @@ async function deleteComputerAPI(id) {
 }
 
 /**
- * Sends a Wake-on-LAN packet to wake a computer
- * @param {string} id - Computer ID to wake
- * @returns {Promise<Object>} Wake result with message
- */
-async function wakeComputer(id) {
-  try {
-    const response = await fetch(`${API_BASE_URL}/wake/${id}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
-    const json = await parseJSONOrThrow(response);
-    if (!json.success) throw new Error(json.error);
-    return json.data;
-  } catch (error) {
-    console.error(`Failed to wake computer ${id}:`, error);
-    throw error;
-  }
-}
-
-/**
  * Fetches health statuses for all computers from the backend
  * @returns {Promise<Array>} Array of health status objects
  */
@@ -664,12 +644,6 @@ function renderCard(computer, statusData = null) {
     <div class="card__footer">
       <span class="card__time">${timeText}</span>
       <div class="card__buttons">
-        <button class="btn-wake ${status === 'OFF' ? 'btn-wake--pulse' : ''}" data-id="${computer.id}" title="Wake-on-LAN (send magic packet)">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" aria-hidden="true" focusable="false">
-            <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
-            <line x1="12" y1="2" x2="12" y2="12"/>
-          </svg>
-        </button>
         <button class="btn-insights" data-id="${computer.id}" title="CPU overview (lscpu, free -h, dmesg)">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" aria-hidden="true" focusable="false">
             <path d="M3 3v18h18"/>
@@ -727,9 +701,6 @@ function renderCard(computer, statusData = null) {
   }
 
   // Attach event listeners to buttons
-  document
-    .querySelector(`#card-${computer.id} .btn-wake`)
-    .addEventListener("click", () => handleWakeComputer(computer.id));
   document
     .querySelector(`#card-${computer.id} .btn-insights`)
     .addEventListener("click", () => handleOpenSystemInfo(computer.id));
@@ -2015,37 +1986,6 @@ function setupEventListeners() {
     }
   });
 }
-
-// ============================================================================
-// Wake-on-LAN Handler
-// ============================================================================
-
-async function handleWakeComputer(id) {
-  const computer = computers.find((c) => c.id === id);
-  if (!computer) return;
-
-  const wakeBtn = document.querySelector(`#card-${id} .btn-wake`);
-  if (wakeBtn) {
-    wakeBtn.disabled = true;
-    wakeBtn.innerHTML = '<span class="spinner"></span>';
-  }
-
-  try {
-    const result = await wakeComputer(id);
-    showToast(result.message || `Wake-on-LAN packet sent to ${computer.place}`, "success");
-  } catch (error) {
-    showToast(`Failed to wake ${computer.place}: ${error.message}`, "error");
-  } finally {
-    if (wakeBtn) {
-      wakeBtn.disabled = false;
-      wakeBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1">
-        <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
-        <line x1="12" y1="2" x2="12" y2="12"/>
-      </svg>`;
-    }
-  }
-}
-
 // ============================================================================
 // Health Status Polling
 // ============================================================================

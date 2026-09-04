@@ -1554,36 +1554,6 @@ header {
   transform: none !important;
 }
 
-.btn-wake {
-  background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
-  border: 1px solid rgba(59, 130, 246, 0.35);
-  color: #fff;
-  padding: 0.5rem;
-  border-radius: 6px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
-  min-width: 34px;
-}
-
-.btn-wake:hover {
-  border-color: rgba(59, 130, 246, 0.65);
-  background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
-  transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(59, 130, 246, 0.2);
-}
-
-.btn-wake--pulse {
-  animation: glow 2s ease-in-out infinite;
-}
-
-.btn-wake:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-  transform: none !important;
-}
 
 /* ============================================================================
    System Info Full Page
