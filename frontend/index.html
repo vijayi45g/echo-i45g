@@ -1,341 +1,342 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Network Monitor</title>
-    <link rel="stylesheet" href="styles.css" />
-  </head>
-  <body>
-    <!-- ============================================================================ -->
-    <!-- Header -->
-    <!-- ============================================================================ -->
-    <header>
-      <div class="header__left">
-        <h1>Echo <span>i45g</span></h1>
-        <p>CLICK CHECK ON EACH CARD OR CHECK ALL AT ONCE</p>
-      </div>
-      <div class="header__right">
-        <button id="btn-add" class="btn btn--primary">+ Add Computer</button>
-        <button id="btn-ping-all" class="btn btn--outline">Check All</button>
-        <button id="btn-terminal-all" class="btn btn--outline">Run Command on All</button>
-        <button id="btn-file-transfer" class="btn btn--outline">File Transfer</button>
-      </div>
-    </header>
 
-    <!-- ============================================================================ -->
-    <!-- Summary Statistics -->
-    <!-- ============================================================================ -->
-    <div class="summary">
-      <div class="summary__item summary__item--total">
-        <span class="summary__label">Total</span>
-        <span class="summary__value" id="count-total">—</span>
-      </div>
-      <div class="summary__item summary__item--online">
-        <span class="summary__label">Online</span>
-        <span class="summary__value" id="count-online">—</span>
-      </div>
-      <div class="summary__item summary__item--offline">
-        <span class="summary__label">Offline</span>
-        <span class="summary__value" id="count-offline">—</span>
-      </div>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Echo i45g</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+
+<body>
+  <!-- ============================================================================ -->
+  <!-- Header -->
+  <!-- ============================================================================ -->
+  <header>
+    <div class="header__left">
+      <h1>Echo <span>i45g</span></h1>
+      <p>CLICK CHECK ON EACH CARD OR CHECK ALL AT ONCE</p>
     </div>
+    <div class="header__right">
+      <button id="btn-add" class="btn btn--primary">+ Add Computer</button>
+      <button id="btn-ping-all" class="btn btn--outline">Check All</button>
+      <button id="btn-terminal-all" class="btn btn--outline">Run Command on All</button>
+      <button id="btn-file-transfer" class="btn btn--outline">File Transfer</button>
+    </div>
+  </header>
 
-    <!-- ============================================================================ -->
-    <!-- Error Message -->
-    <!-- ============================================================================ -->
-    <div id="error"></div>
+  <!-- ============================================================================ -->
+  <!-- Summary Statistics -->
+  <!-- ============================================================================ -->
+  <div class="summary">
+    <div class="summary__item summary__item--total">
+      <span class="summary__label">Total</span>
+      <span class="summary__value" id="count-total">—</span>
+    </div>
+    <div class="summary__item summary__item--online">
+      <span class="summary__label">Online</span>
+      <span class="summary__value" id="count-online">—</span>
+    </div>
+    <div class="summary__item summary__item--offline">
+      <span class="summary__label">Offline</span>
+      <span class="summary__value" id="count-offline">—</span>
+    </div>
+  </div>
 
-    <!-- ============================================================================ -->
-    <!-- Computer Grid -->
-    <!-- ============================================================================ -->
-    <div id="grid"></div>
+  <!-- ============================================================================ -->
+  <!-- Error Message -->
+  <!-- ============================================================================ -->
+  <div id="error"></div>
 
-    <!-- ============================================================================ -->
-    <!-- Add Computer Modal -->
-    <!-- ============================================================================ -->
-    <div id="modal" class="modal">
-      <div class="modal__box">
-        <div class="modal__header">
-          <h2>Add Computer</h2>
-          <button id="modal-close" class="modal__close">✕</button>
+  <!-- ============================================================================ -->
+  <!-- Computer Grid -->
+  <!-- ============================================================================ -->
+  <div id="grid"></div>
+
+  <!-- ============================================================================ -->
+  <!-- Add Computer Modal -->
+  <!-- ============================================================================ -->
+  <div id="modal" class="modal">
+    <div class="modal__box">
+      <div class="modal__header">
+        <h2>Add Computer</h2>
+        <button id="modal-close" class="modal__close">✕</button>
+      </div>
+      <form id="add-form">
+        <div class="form__group">
+          <label for="form-id">ID</label>
+          <input id="form-id" type="text" placeholder="e.g. 3" required />
         </div>
-        <form id="add-form">
-          <div class="form__group">
-            <label for="form-id">ID</label>
-            <input id="form-id" type="text" placeholder="e.g. 3" required />
+        <div class="form__group">
+          <label for="form-place">Place</label>
+          <input id="form-place" type="text" placeholder="e.g. Office PC" required />
+        </div>
+        <div class="form__group">
+          <label for="form-user-name">User Name</label>
+          <input id="form-user-name" type="text" placeholder="e.g. sysadmin" required />
+        </div>
+        <div class="form__group">
+          <label for="form-ip">IP Address</label>
+          <input id="form-ip" type="text" placeholder="e.g. 192.168.68.110" required />
+        </div>
+        <button id="form-submit" type="submit" class="btn btn--primary btn--full">
+          Add Computer
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============================================================================ -->
+  <!-- Edit Computer Modal -->
+  <!-- ============================================================================ -->
+  <div id="edit-modal" class="modal">
+    <div class="modal__box">
+      <div class="modal__header">
+        <h2>Edit Computer</h2>
+        <button id="edit-modal-close" class="modal__close">✕</button>
+      </div>
+      <form id="edit-form">
+        <div class="form__group">
+          <label for="edit-form-id">ID</label>
+          <input id="edit-form-id" type="text" disabled />
+        </div>
+        <div class="form__group">
+          <label for="edit-form-place">Place</label>
+          <input id="edit-form-place" type="text" placeholder="e.g. Office PC" required />
+        </div>
+        <div class="form__group">
+          <label for="edit-form-user-name">User Name</label>
+          <input id="edit-form-user-name" type="text" placeholder="e.g. sysadmin" required />
+        </div>
+        <div class="form__group">
+          <label for="edit-form-ip">IP Address</label>
+          <input id="edit-form-ip" type="text" placeholder="e.g. 192.168.68.110" required />
+        </div>
+        <button id="edit-form-submit" type="submit" class="btn btn--primary btn--full">
+          Update Computer
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============================================================================ -->
+  <!-- Terminal Modal (Full Screen) -->
+  <!-- ============================================================================ -->
+  <div id="terminal-modal" class="terminal-modal">
+    <div class="terminal-modal__container">
+      <!-- Terminal Header -->
+      <div class="terminal-modal__header">
+        <div class="terminal-modal__title-bar">
+          <div class="terminal-modal__title">
+            <span class="terminal-modal__title-icon">⌘</span>
+            <span id="terminal-title">Terminal</span>
           </div>
-          <div class="form__group">
-            <label for="form-place">Place</label>
-            <input id="form-place" type="text" placeholder="e.g. Office PC" required />
-          </div>
-          <div class="form__group">
-            <label for="form-user-name">User Name</label>
-            <input id="form-user-name" type="text" placeholder="e.g. sysadmin" required />
-          </div>
-          <div class="form__group">
-            <label for="form-ip">IP Address</label>
-            <input id="form-ip" type="text" placeholder="e.g. 192.168.68.110" required />
-          </div>
-          <button id="form-submit" type="submit" class="btn btn--primary btn--full">
-            Add Computer
+          <button id="terminal-modal-close" class="terminal-modal__close-btn" title="Close (Esc)">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
           </button>
-        </form>
-      </div>
-    </div>
-
-    <!-- ============================================================================ -->
-    <!-- Edit Computer Modal -->
-    <!-- ============================================================================ -->
-    <div id="edit-modal" class="modal">
-      <div class="modal__box">
-        <div class="modal__header">
-          <h2>Edit Computer</h2>
-          <button id="edit-modal-close" class="modal__close">✕</button>
         </div>
-        <form id="edit-form">
-          <div class="form__group">
-            <label for="edit-form-id">ID</label>
-            <input id="edit-form-id" type="text" disabled />
-          </div>
-          <div class="form__group">
-            <label for="edit-form-place">Place</label>
-            <input id="edit-form-place" type="text" placeholder="e.g. Office PC" required />
-          </div>
-          <div class="form__group">
-            <label for="edit-form-user-name">User Name</label>
-            <input id="edit-form-user-name" type="text" placeholder="e.g. sysadmin" required />
-          </div>
-          <div class="form__group">
-            <label for="edit-form-ip">IP Address</label>
-            <input id="edit-form-ip" type="text" placeholder="e.g. 192.168.68.110" required />
-          </div>
-          <button id="edit-form-submit" type="submit" class="btn btn--primary btn--full">
-            Update Computer
+      </div>
+
+      <!-- Terminal Output Area -->
+      <div class="terminal-modal__output-wrapper">
+        <div class="terminal-modal__output" id="terminal-output"></div>
+        <div class="terminal-modal__cursor"></div>
+      </div>
+
+      <!-- Terminal Input Bar + Status -->
+      <div class="terminal-modal__footer">
+        <div class="terminal-modal__input-group">
+          <span class="terminal-modal__prompt">$</span>
+          <input type="text" id="terminal-input" class="terminal-modal__input"
+            placeholder="Type command here and press Enter (or type directly in the terminal)..." autocomplete="off"
+            spellcheck="false" />
+          <button id="terminal-send-btn" class="terminal-modal__send" title="Send (Enter)">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M22 2L11 13m11-11l-7 20L2 11l20-9z" />
+            </svg>
           </button>
-        </form>
-      </div>
-    </div>
-
-    <!-- ============================================================================ -->
-    <!-- Terminal Modal (Full Screen) -->
-    <!-- ============================================================================ -->
-    <div id="terminal-modal" class="terminal-modal">
-      <div class="terminal-modal__container">
-        <!-- Terminal Header -->
-        <div class="terminal-modal__header">
-          <div class="terminal-modal__title-bar">
-            <div class="terminal-modal__title">
-              <span class="terminal-modal__title-icon">⌘</span>
-              <span id="terminal-title">Terminal</span>
-            </div>
-            <button id="terminal-modal-close" class="terminal-modal__close-btn" title="Close (Esc)">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
-            </button>
-          </div>
         </div>
-
-        <!-- Terminal Output Area -->
-        <div class="terminal-modal__output-wrapper">
-          <div class="terminal-modal__output" id="terminal-output"></div>
-          <div class="terminal-modal__cursor"></div>
-        </div>
-
-        <!-- Terminal Input Bar + Status -->
-        <div class="terminal-modal__footer">
-          <div class="terminal-modal__input-group">
-            <span class="terminal-modal__prompt">$</span>
-            <input 
-              type="text" 
-              id="terminal-input" 
-              class="terminal-modal__input" 
-              placeholder="Type command here and press Enter (or type directly in the terminal)..."
-              autocomplete="off"
-              spellcheck="false"
-            />
-            <button id="terminal-send-btn" class="terminal-modal__send" title="Send (Enter)">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M22 2L11 13m11-11l-7 20L2 11l20-9z"/>
-              </svg>
-            </button>
-          </div>
-          <div class="terminal-modal__status-bar">
-            <span id="terminal-status">Ready</span>
-          </div>
+        <div class="terminal-modal__status-bar">
+          <span id="terminal-status">Ready</span>
         </div>
       </div>
     </div>
+  </div>
 
-    <!-- ============================================================================ -->
-    <!-- Multi-Command SSH Modal (Run on Many Computers) -->
-    <!-- ============================================================================ -->
-    <div id="multi-terminal-modal" class="modal">
-      <div class="modal__box multi-terminal__box">
-        <div class="modal__header">
-          <h2>Run Command on All Computers</h2>
-          <button id="multi-terminal-close" class="modal__close">✕</button>
-        </div>
-        <div class="multi-terminal__terminal">
-          <div class="multi-terminal__terminal-output" id="multi-terminal-log"></div>
-          <div class="multi-terminal__terminal-footer">
-            <span class="multi-terminal__prompt">$</span>
-            <input
-              id="multi-terminal-command"
-              type="text"
-              class="multi-terminal__input"
-              placeholder="Type a command to run on all systems (e.g. whoami, hostname, uptime)"
-              autocomplete="off"
-              spellcheck="false"
-            />
-            <button id="multi-terminal-run" class="multi-terminal__send" title="Run on all">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M22 2L11 13m11-11l-7 20L2 11l20-9z"/>
-              </svg>
-            </button>
-          </div>
-        </div>
+  <!-- ============================================================================ -->
+  <!-- Multi-Command SSH Modal (Run on Many Computers) -->
+  <!-- ============================================================================ -->
+  <div id="multi-terminal-modal" class="modal">
+    <div class="modal__box multi-terminal__box">
+      <div class="modal__header">
+        <h2>Run Command on All Computers</h2>
+        <button id="multi-terminal-close" class="modal__close">✕</button>
       </div>
-    </div>
-
-    <!-- ============================================================================ -->
-    <!-- File Transfer Modal -->
-    <!-- ============================================================================ -->
-    <div id="file-transfer-modal" class="modal">
-      <div class="modal__box file-transfer__box">
-        <div class="modal__header">
-          <h2>File Transfer</h2>
-          <button id="file-transfer-close" class="modal__close">✕</button>
-        </div>
-
-        <div class="file-transfer__selectors">
-          <div class="form__group">
-            <label for="file-transfer-source">Source Computer</label>
-            <select id="file-transfer-source" class="file-transfer__select"></select>
-          </div>
-          <div class="form__group">
-            <label for="file-transfer-target">Paste Target Computer</label>
-            <select id="file-transfer-target" class="file-transfer__select"></select>
-          </div>
-        </div>
-
-        <div class="file-transfer__nav">
-          <button id="file-transfer-up" class="btn btn--outline btn--icon" type="button">↑</button>
-          <code id="file-transfer-path">-</code>
-        </div>
-
-        <div id="file-transfer-roots" class="file-transfer__roots"></div>
-        <div id="file-transfer-list" class="file-transfer__list"></div>
-        <p class="file-transfer__selected">Selected: <span id="file-transfer-selected">None</span></p>
-
-        <div class="file-transfer__actions">
-          <button id="file-transfer-download" class="btn btn--primary" type="button">
-            Download Selected (File or Folder)
-          </button>
-          <button id="file-transfer-copy" class="btn btn--outline" type="button">
-            Copy / Paste Selected
-          </button>
-          <button id="file-transfer-merge" class="btn btn--outline" type="button">
-            Merge Folder (Overwrite If Newer)
-          </button>
-          <button id="file-transfer-undo" class="btn btn--outline" type="button">
-            Undo Last Merge (Target Computer)
+      <div class="multi-terminal__terminal">
+        <div class="multi-terminal__terminal-output" id="multi-terminal-log"></div>
+        <div class="multi-terminal__terminal-footer">
+          <span class="multi-terminal__prompt">$</span>
+          <input id="multi-terminal-command" type="text" class="multi-terminal__input"
+            placeholder="Type a command to run on all systems (e.g. whoami, hostname, uptime)" autocomplete="off"
+            spellcheck="false" />
+          <button id="multi-terminal-run" class="multi-terminal__send" title="Run on all">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M22 2L11 13m11-11l-7 20L2 11l20-9z" />
+            </svg>
           </button>
         </div>
       </div>
     </div>
+  </div>
 
-    <!-- ============================================================================ -->
-    <!-- System Info Full-Page View -->
-    <!-- ============================================================================ -->
-    <div id="system-info-page" class="system-info-page">
-      <div class="system-info-page__header">
-        <div>
-          <h2 id="system-info-title">System Insights</h2>
-          <p id="system-info-subtitle">Collecting host metrics...</p>
+  <!-- ============================================================================ -->
+  <!-- File Transfer Modal -->
+  <!-- ============================================================================ -->
+  <div id="file-transfer-modal" class="modal">
+    <div class="modal__box file-transfer__box">
+      <div class="modal__header">
+        <h2>File Transfer</h2>
+        <button id="file-transfer-close" class="modal__close">✕</button>
+      </div>
+
+      <div class="file-transfer__selectors">
+        <div class="form__group">
+          <label for="file-transfer-source">Source Computer</label>
+          <select id="file-transfer-source" class="file-transfer__select"></select>
         </div>
-        <button id="system-info-close" class="system-info-page__close" title="Close">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-            <line x1="18" y1="6" x2="6" y2="18"></line>
-            <line x1="6" y1="6" x2="18" y2="18"></line>
-          </svg>
+        <div class="form__group">
+          <label for="file-transfer-target">Paste Target Computer</label>
+          <select id="file-transfer-target" class="file-transfer__select"></select>
+        </div>
+        <div class="form__group file-transfer__target-path-row">
+          <label for="file-transfer-target-path">Paste Destination Path</label>
+          <div class="file-transfer__target-path-input">
+            <input id="file-transfer-target-path" type="text" placeholder="~/Downloads (default — leave empty)" />
+            <button id="file-transfer-use-current-path" class="btn btn--outline btn--sm" type="button">Use Current Path</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="file-transfer__nav">
+        <button id="file-transfer-up" class="btn btn--outline btn--icon" type="button">↑</button>
+        <code id="file-transfer-path">-</code>
+      </div>
+
+      <div id="file-transfer-roots" class="file-transfer__roots"></div>
+      <div id="file-transfer-list" class="file-transfer__list"></div>
+      <p class="file-transfer__selected">Selected: <span id="file-transfer-selected">None</span></p>
+
+      <div class="file-transfer__actions">
+        <button id="file-transfer-download" class="btn btn--primary" type="button">
+          Download Selected (File or Folder)
+        </button>
+        <button id="file-transfer-copy" class="btn btn--outline" type="button">
+          Copy / Paste Selected
+        </button>
+        <button id="file-transfer-merge" class="btn btn--outline" type="button">
+          Merge Folder (Overwrite Existing)
+        </button>
+        <button id="file-transfer-undo" class="btn btn--outline" type="button">
+          Undo Last Merge (Target Computer)
         </button>
       </div>
+    </div>
+  </div>
 
-      <div class="system-info-page__content">
-        <p id="system-info-message" class="system-info-page__message"></p>
-
-        <div class="system-info-page__meta">
-          <div class="system-info-chip">
-            <span class="system-info-chip__label">Operating System</span>
-            <strong id="system-info-os">-</strong>
-          </div>
-          <div class="system-info-chip">
-            <span class="system-info-chip__label">CPU Model</span>
-            <strong id="system-info-cpu-model">-</strong>
-          </div>
-          <div class="system-info-chip">
-            <span class="system-info-chip__label">CPU Topology</span>
-            <strong id="system-info-cpu-arch">-</strong>
-          </div>
-          <div class="system-info-chip">
-            <span class="system-info-chip__label">Collected At</span>
-            <strong id="system-info-updated">-</strong>
-          </div>
-        </div>
-
-        <div class="system-info-grid">
-          <article class="system-metric-card">
-            <h3>CPU Load</h3>
-            <p class="system-metric-card__value" id="system-cpu-percent">0%</p>
-            <div class="system-meter">
-              <span id="system-cpu-bar"></span>
-            </div>
-            <p class="system-metric-card__detail" id="system-cpu-text">-</p>
-          </article>
-
-          <article class="system-metric-card">
-            <h3>RAM Usage</h3>
-            <p class="system-metric-card__value" id="system-memory-percent">0%</p>
-            <div class="system-meter">
-              <span id="system-memory-bar"></span>
-            </div>
-            <p class="system-metric-card__detail" id="system-memory-text">0 GB / 0 GB</p>
-          </article>
-
-          <article class="system-metric-card">
-            <h3>Storage Usage ( / )</h3>
-            <p class="system-metric-card__value" id="system-disk-percent">0%</p>
-            <div class="system-meter">
-              <span id="system-disk-bar"></span>
-            </div>
-            <p class="system-metric-card__detail" id="system-disk-text">0 GB / 0 GB</p>
-          </article>
-        </div>
-
-        <article class="system-report-card">
-          <h3>System Report</h3>
-          <p id="system-report-summary" class="system-report-card__summary">Analyzing host metrics...</p>
-          <ul class="system-report-list">
-            <li id="system-report-os">OS: -</li>
-            <li id="system-report-cpu">CPU: -</li>
-            <li id="system-report-ram">RAM: -</li>
-            <li id="system-report-storage">Storage: -</li>
-            <li id="system-report-health">Health: -</li>
-          </ul>
-        </article>
+  <!-- ============================================================================ -->
+  <!-- System Info Full-Page View -->
+  <!-- ============================================================================ -->
+  <div id="system-info-page" class="system-info-page">
+    <div class="system-info-page__header">
+      <div>
+        <h2 id="system-info-title">System Insights</h2>
+        <p id="system-info-subtitle">Collecting host metrics...</p>
       </div>
+      <button id="system-info-close" class="system-info-page__close" title="Close">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
     </div>
 
-    <!-- ============================================================================ -->
-    <!-- Toast Notification -->
-    <!-- ============================================================================ -->
-    <div id="toast" class="toast"></div>
+    <div class="system-info-page__content">
+      <p id="system-info-message" class="system-info-page__message"></p>
 
-    <!-- ============================================================================ -->
-    <!-- Scripts -->
-    <!-- ============================================================================ -->
-    <script src="app.js"></script>
-  </body>
+      <div class="system-info-page__meta">
+        <div class="system-info-chip">
+          <span class="system-info-chip__label">Operating System</span>
+          <strong id="system-info-os">-</strong>
+        </div>
+        <div class="system-info-chip">
+          <span class="system-info-chip__label">CPU Model</span>
+          <strong id="system-info-cpu-model">-</strong>
+        </div>
+        <div class="system-info-chip">
+          <span class="system-info-chip__label">CPU Topology</span>
+          <strong id="system-info-cpu-arch">-</strong>
+        </div>
+        <div class="system-info-chip">
+          <span class="system-info-chip__label">Collected At</span>
+          <strong id="system-info-updated">-</strong>
+        </div>
+      </div>
+
+      <div class="system-info-grid">
+        <article class="system-metric-card">
+          <h3>CPU Load</h3>
+          <p class="system-metric-card__value" id="system-cpu-percent">0%</p>
+          <div class="system-meter">
+            <span id="system-cpu-bar"></span>
+          </div>
+          <p class="system-metric-card__detail" id="system-cpu-text">-</p>
+        </article>
+
+        <article class="system-metric-card">
+          <h3>RAM Usage</h3>
+          <p class="system-metric-card__value" id="system-memory-percent">0%</p>
+          <div class="system-meter">
+            <span id="system-memory-bar"></span>
+          </div>
+          <p class="system-metric-card__detail" id="system-memory-text">0 GB / 0 GB</p>
+        </article>
+
+        <article class="system-metric-card">
+          <h3>Storage Usage ( / )</h3>
+          <p class="system-metric-card__value" id="system-disk-percent">0%</p>
+          <div class="system-meter">
+            <span id="system-disk-bar"></span>
+          </div>
+          <p class="system-metric-card__detail" id="system-disk-text">0 GB / 0 GB</p>
+        </article>
+      </div>
+
+      <article class="system-report-card">
+        <h3>System Report</h3>
+        <p id="system-report-summary" class="system-report-card__summary">Analyzing host metrics...</p>
+        <ul class="system-report-list">
+          <li id="system-report-os">OS: -</li>
+          <li id="system-report-cpu">CPU: -</li>
+          <li id="system-report-ram">RAM: -</li>
+          <li id="system-report-storage">Storage: -</li>
+          <li id="system-report-health">Health: -</li>
+        </ul>
+      </article>
+    </div>
+  </div>
+
+  <!-- ============================================================================ -->
+  <!-- Toast Notification -->
+  <!-- ============================================================================ -->
+  <div id="toast" class="toast"></div>
+
+  <!-- ============================================================================ -->
+  <!-- Scripts -->
+  <!-- ============================================================================ -->
+  <script src="app.js"></script>
+</body>
+
 </html>

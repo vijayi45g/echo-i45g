@@ -13,13 +13,22 @@
 // Configuration
 // ============================================================================
 
-const API_BASE_URL = "http://localhost:8081/api";
+const API_BASE_URL = "/api";
+
+function terminalWebSocketURL(computerId) {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/api/terminal/ws?computerId=${encodeURIComponent(computerId)}`;
+}
 
 // ============================================================================
 // State Management
 // ============================================================================
 
 let computers = [];
+let healthStatuses = {}; // Map of computerId -> { status, osName, lastChecked }
+let healthPollTimer = null;
+const HEALTH_POLL_INTERVAL = 60000; // 60 seconds
+
 const fileTransferState = {
   sourceComputerId: "",
   targetComputerId: "",
@@ -29,6 +38,9 @@ const fileTransferState = {
   roots: [],
   entries: [],
   selectedPath: "",
+  lastMergeId: null,
+  browsingTarget: false,
+  savedSourceState: null,
 };
 
 // ============================================================================
@@ -228,18 +240,6 @@ async function copyTransferPath(
 
   const json = await parseJSONOrThrow(response);
   if (!json.success) throw new Error(json.error || "Copy failed.");
-  return json.data;
-}
-
-async function undoLastMerge(computerId) {
-  const response = await fetch(`${API_BASE_URL}/file-transfer/undo`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ computerId }),
-  });
-
-  const json = await parseJSONOrThrow(response);
-  if (!json.success) throw new Error(json.error || "Undo failed.");
   return json.data;
 }
 
@@ -591,6 +591,42 @@ async function deleteComputerAPI(id) {
   }
 }
 
+/**
+ * Sends a Wake-on-LAN packet to wake a computer
+ * @param {string} id - Computer ID to wake
+ * @returns {Promise<Object>} Wake result with message
+ */
+async function wakeComputer(id) {
+  try {
+    const response = await fetch(`${API_BASE_URL}/wake/${id}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    const json = await parseJSONOrThrow(response);
+    if (!json.success) throw new Error(json.error);
+    return json.data;
+  } catch (error) {
+    console.error(`Failed to wake computer ${id}:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Fetches health statuses for all computers from the backend
+ * @returns {Promise<Array>} Array of health status objects
+ */
+async function fetchHealthStatus() {
+  try {
+    const response = await fetch(`${API_BASE_URL}/health-status`);
+    const json = await parseJSONOrThrow(response);
+    if (!json.success) throw new Error(json.error);
+    return json.data || [];
+  } catch (error) {
+    console.error("Failed to fetch health status:", error);
+    return [];
+  }
+}
+
 // ============================================================================
 // UI Rendering
 // ============================================================================
@@ -628,6 +664,12 @@ function renderCard(computer, statusData = null) {
     <div class="card__footer">
       <span class="card__time">${timeText}</span>
       <div class="card__buttons">
+        <button class="btn-wake ${status === 'OFF' ? 'btn-wake--pulse' : ''}" data-id="${computer.id}" title="Wake-on-LAN (send magic packet)">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" aria-hidden="true" focusable="false">
+            <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
+            <line x1="12" y1="2" x2="12" y2="12"/>
+          </svg>
+        </button>
         <button class="btn-insights" data-id="${computer.id}" title="CPU overview (lscpu, free -h, dmesg)">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" aria-hidden="true" focusable="false">
             <path d="M3 3v18h18"/>
@@ -685,6 +727,9 @@ function renderCard(computer, statusData = null) {
   }
 
   // Attach event listeners to buttons
+  document
+    .querySelector(`#card-${computer.id} .btn-wake`)
+    .addEventListener("click", () => handleWakeComputer(computer.id));
   document
     .querySelector(`#card-${computer.id} .btn-insights`)
     .addEventListener("click", () => handleOpenSystemInfo(computer.id));
@@ -1231,7 +1276,7 @@ function initPlainTerminal(computer, container) {
   appendLine(`Connecting to ${computer.username}@${computer.ip}...`);
   statusEl.textContent = "Connecting...";
 
-  const wsURL = `ws://localhost:8081/api/terminal/ws?computerId=${encodeURIComponent(computer.id)}`;
+  const wsURL = terminalWebSocketURL(computer.id);
   terminalSocket = new WebSocket(wsURL);
   // Ensure stdout/stderr binary frames arrive as ArrayBuffer, not Blob
   terminalSocket.binaryType = "arraybuffer";
@@ -1303,7 +1348,7 @@ function initXterm(computer, container) {
   terminalInstance.write("\x1b[1;34mConnecting to " + computer.username + "@" + computer.ip + "...\x1b[0m\r\n");
   document.getElementById("terminal-status").textContent = "Connecting...";
 
-  const wsURL = `ws://localhost:8081/api/terminal/ws?computerId=${encodeURIComponent(computer.id)}`;
+  const wsURL = terminalWebSocketURL(computer.id);
   terminalSocket = new WebSocket(wsURL);
   terminalSocket.binaryType = "arraybuffer";
 
@@ -1556,6 +1601,9 @@ function openFileTransferModal(initialSourceId = "") {
   fileTransferState.selectedPath = "";
   selectFileTransferPath("");
 
+  const targetPathInput = document.getElementById("file-transfer-target-path");
+  if (targetPathInput) targetPathInput.value = "";
+
   document.getElementById("file-transfer-modal").classList.add("modal--open");
   refreshFileTransferList("");
 }
@@ -1602,6 +1650,7 @@ async function handleFileTransferCopy() {
   const sourceId = fileTransferState.sourceComputerId;
   const targetId = document.getElementById("file-transfer-target")?.value || "";
   const selectedPath = fileTransferState.selectedPath;
+  const targetPath = document.getElementById("file-transfer-target-path")?.value?.trim() || "";
 
   if (!sourceId || !targetId || !selectedPath) {
     showToast("Select source file/folder and target computer first.", "error");
@@ -1619,8 +1668,9 @@ async function handleFileTransferCopy() {
   button.textContent = "Pasting...";
 
   try {
-    await copyTransferPath(sourceId, selectedPath, targetId, "", "copy");
-    showToast(`Pasted to ${getComputerLabelById(targetId)} (Downloads/Home).`, "success");
+    await copyTransferPath(sourceId, selectedPath, targetId, targetPath, "copy");
+    const dest = targetPath || "Downloads/Home";
+    showToast(`Pasted to ${getComputerLabelById(targetId)} (${dest}).`, "success");
   } catch (error) {
     showToast(`Paste failed: ${error.message}`, "error");
   } finally {
@@ -1633,22 +1683,15 @@ async function handleFileTransferMerge() {
   const sourceId = fileTransferState.sourceComputerId;
   const targetId = document.getElementById("file-transfer-target")?.value || "";
   const selectedPath = fileTransferState.selectedPath;
+  const targetPath = document.getElementById("file-transfer-target-path")?.value?.trim() || "";
 
   if (!sourceId || !targetId || !selectedPath) {
-    showToast("Select source folder and target computer first.", "error");
+    showToast("Select source file/folder and target computer first.", "error");
     return;
   }
 
   if (sourceId === targetId) {
     showToast("Choose a different target computer for merge.", "error");
-    return;
-  }
-
-  // Ensure the selected path is a directory before attempting merge.
-  const entries = Array.isArray(fileTransferState.entries) ? fileTransferState.entries : [];
-  const entry = entries.find((e) => e.path === selectedPath);
-  if (!entry || !entry.isDir) {
-    showToast("Merge is only supported for folders. Please select a folder.", "error");
     return;
   }
 
@@ -1658,11 +1701,13 @@ async function handleFileTransferMerge() {
   button.textContent = "Merging...";
 
   try {
-    await copyTransferPath(sourceId, selectedPath, targetId, "", "merge_newer");
-    showToast(
-      `Merged folder into ${getComputerLabelById(targetId)} (Downloads/Home).`,
-      "success"
-    );
+    const result = await copyTransferPath(sourceId, selectedPath, targetId, targetPath, "merge_newer");
+    // Capture mergeId for undo support.
+    if (result && result.mergeId != null) {
+      fileTransferState.lastMergeId = result.mergeId;
+    }
+    const dest = targetPath || "Downloads/Home";
+    showToast(`Merged folder into ${getComputerLabelById(targetId)} (${dest}). You can undo this merge.`, "success");
   } catch (error) {
     showToast(`Merge failed: ${error.message}`, "error");
   } finally {
@@ -1673,10 +1718,49 @@ async function handleFileTransferMerge() {
 
 async function handleFileTransferUndo() {
   const targetId = document.getElementById("file-transfer-target")?.value || "";
+
   if (!targetId) {
-    showToast("Select a target computer to undo the last merge.", "error");
+    showToast("Select a target computer first.", "error");
     return;
   }
+
+  let mergeId = fileTransferState.lastMergeId;
+
+  // If no recent mergeId in memory, query the merge history for the latest.
+  if (!mergeId) {
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/file-transfer/merge-history?targetComputerId=${encodeURIComponent(targetId)}&limit=1`
+      );
+      const json = await parseJSONOrThrow(response);
+      if (json.success && Array.isArray(json.data) && json.data.length > 0) {
+        const latest = json.data[0];
+        if (latest.status === "completed") {
+          mergeId = latest.id;
+        } else {
+          showToast("The most recent merge has already been rolled back.", "error");
+          return;
+        }
+      } else {
+        showToast("No merge history found for this target computer.", "error");
+        return;
+      }
+    } catch (error) {
+      showToast(`Failed to retrieve merge history: ${error.message}`, "error");
+      return;
+    }
+  }
+
+  // Confirm before proceeding with the destructive undo operation.
+  const targetLabel = getComputerLabelById(targetId);
+  const confirmed = confirm(
+    `Are you sure you want to undo merge #${mergeId} on ${targetLabel}?\n\n` +
+    `This will restore the previous state by:\n` +
+    `• Removing files that were added during the merge\n` +
+    `• Restoring files that were overwritten\n\n` +
+    `This action cannot be undone.`
+  );
+  if (!confirmed) return;
 
   const button = document.getElementById("file-transfer-undo");
   button.disabled = true;
@@ -1684,8 +1768,23 @@ async function handleFileTransferUndo() {
   button.textContent = "Undoing...";
 
   try {
-    await undoLastMerge(targetId);
-    showToast(`Undo complete on ${getComputerLabelById(targetId)}.`, "success");
+    const response = await fetch(`${API_BASE_URL}/file-transfer/unmerge`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mergeId }),
+    });
+    const json = await parseJSONOrThrow(response);
+    if (!json.success) throw new Error(json.error || "Undo failed.");
+
+    fileTransferState.lastMergeId = null;
+    showToast(`Merge #${mergeId} rolled back successfully on ${targetLabel}.`, "success");
+
+    // Refresh the file listing to show the restored state.
+    try {
+      refreshFileTransferList(fileTransferState.currentPath || "");
+    } catch (_refreshErr) {
+      // Non-critical; don't block success toast.
+    }
   } catch (error) {
     showToast(`Undo failed: ${error.message}`, "error");
   } finally {
@@ -1693,6 +1792,18 @@ async function handleFileTransferUndo() {
     button.textContent = previousLabel;
   }
 }
+
+function handleUseCurrentPath() {
+  const currentPath = fileTransferState.currentPath;
+  if (!currentPath) {
+    showToast("Navigate to a folder first, then click this button.", "error");
+    return;
+  }
+  const targetPathInput = document.getElementById("file-transfer-target-path");
+  if (targetPathInput) targetPathInput.value = currentPath;
+  showToast(`Paste destination set to: ${currentPath}`, "success");
+}
+
 // ============================================================================
 // Modal Management
 // ============================================================================
@@ -1750,6 +1861,10 @@ async function init() {
     document.getElementById("count-online").textContent = "0";
     document.getElementById("count-offline").textContent = "0";
     console.log(`Loaded ${computers.length} computers successfully`);
+
+    // Fetch initial health statuses and start polling
+    await refreshHealthStatuses();
+    startHealthPolling();
   } catch (error) {
     const errorDiv = document.getElementById("error");
     errorDiv.style.display = "block";
@@ -1831,6 +1946,7 @@ function setupEventListeners() {
   document.getElementById("file-transfer-copy").addEventListener("click", handleFileTransferCopy);
   document.getElementById("file-transfer-merge").addEventListener("click", handleFileTransferMerge);
   document.getElementById("file-transfer-undo").addEventListener("click", handleFileTransferUndo);
+  document.getElementById("file-transfer-use-current-path").addEventListener("click", handleUseCurrentPath);
 
   // Terminal modal listeners
   document.getElementById("terminal-modal-close").addEventListener("click", closeTerminalModal);
@@ -1898,6 +2014,86 @@ function setupEventListeners() {
       }
     }
   });
+}
+
+// ============================================================================
+// Wake-on-LAN Handler
+// ============================================================================
+
+async function handleWakeComputer(id) {
+  const computer = computers.find((c) => c.id === id);
+  if (!computer) return;
+
+  const wakeBtn = document.querySelector(`#card-${id} .btn-wake`);
+  if (wakeBtn) {
+    wakeBtn.disabled = true;
+    wakeBtn.innerHTML = '<span class="spinner"></span>';
+  }
+
+  try {
+    const result = await wakeComputer(id);
+    showToast(result.message || `Wake-on-LAN packet sent to ${computer.place}`, "success");
+  } catch (error) {
+    showToast(`Failed to wake ${computer.place}: ${error.message}`, "error");
+  } finally {
+    if (wakeBtn) {
+      wakeBtn.disabled = false;
+      wakeBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1">
+        <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
+        <line x1="12" y1="2" x2="12" y2="12"/>
+      </svg>`;
+    }
+  }
+}
+
+// ============================================================================
+// Health Status Polling
+// ============================================================================
+
+/**
+ * Refreshes health statuses from the backend and updates all cards.
+ */
+async function refreshHealthStatuses() {
+  const statuses = await fetchHealthStatus();
+  if (!statuses || !statuses.length) return;
+
+  // Build lookup map
+  healthStatuses = {};
+  statuses.forEach((s) => {
+    healthStatuses[s.computerId] = s;
+  });
+
+  // Update all cards with health data
+  let onlineCount = 0;
+  let offlineCount = 0;
+
+  computers.forEach((c) => {
+    const hs = healthStatuses[c.id];
+    if (hs) {
+      const statusData = {
+        status: hs.status,
+        checkedAt: hs.lastChecked,
+      };
+      renderCard(c, statusData);
+
+      if (hs.status === "ON") onlineCount++;
+      else offlineCount++;
+    }
+  });
+
+  // Update summary counts
+  document.getElementById("count-total").textContent = computers.length;
+  document.getElementById("count-online").textContent = onlineCount;
+  document.getElementById("count-offline").textContent = offlineCount;
+}
+
+/**
+ * Starts periodic health status polling every HEALTH_POLL_INTERVAL ms.
+ */
+function startHealthPolling() {
+  if (healthPollTimer) clearInterval(healthPollTimer);
+  healthPollTimer = setInterval(refreshHealthStatuses, HEALTH_POLL_INTERVAL);
+  console.log(`Health status polling started (every ${HEALTH_POLL_INTERVAL / 1000}s)`);
 }
 
 // ✅ Start application — no duplicate listeners below this line

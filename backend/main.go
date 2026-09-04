@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,9 +16,11 @@ import (
 	"os/user"
 	pathpkg "path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/creack/pty"
@@ -180,6 +183,10 @@ func addComputer(w http.ResponseWriter, r *http.Request) {
 		Success: true,
 		Data:    c,
 	})
+
+	// Trigger background MAC discovery for the new computer
+	discoverMacForComputer(c)
+
 	log.Printf("INFO: Computer added to database - ID: %s, Place: %s, Username: %s, IP: %s", c.ID, c.Place, c.Username, c.IP)
 }
 
@@ -360,6 +367,10 @@ func deleteComputerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Clean up associated MAC and health records
+	deleteMacAddress(id)
+	deleteHealthStatus(id)
+
 	writeJSON(w, http.StatusOK, APIResponse{
 		Success: true,
 		Data:    map[string]string{"id": id},
@@ -412,11 +423,7 @@ type FileTransferCopyRequest struct {
 	SourcePath       string `json:"sourcePath"`
 	TargetComputerID string `json:"targetComputerId"`
 	TargetPath       string `json:"targetPath,omitempty"`
-	Mode             string `json:"mode,omitempty"` // "copy" (default), "merge", "merge_newer"
-}
-
-type FileTransferUndoRequest struct {
-	ComputerID string `json:"computerId"`
+	Mode             string `json:"mode,omitempty"` // "copy" (default) or "merge"
 }
 
 // normalizeComputerHost strips spaces/brackets and optional :port so host/IP
@@ -1744,7 +1751,7 @@ awk -F'\\|' '$1 ~ /^>\\+\\+\\+\\+\\+\\+\\+\\+\\+/ {print $2}' "$RSYNC_LOG" > "$C
 
 echo "$OP_ID" > "$UNDO_BASE/last_op"
 echo "OK:$OP_ID"
-`, shellQuote(sourcePath), shellQuote(targetPath)))))
+`, shellQuote(sourcePath), shellQuote(targetPath))))
 
 			copyCmd = rsyncScript
 		} else if req.Mode == "merge" && sourceType == "dir" {
@@ -1764,10 +1771,50 @@ echo "OK:$OP_ID"
 				shellQuote(targetPath),
 			)
 		}
-		if stderr, copyErr := executeCommandStrictForComputer(*sourceComputer, copyCmd); copyErr != nil {
+		stderr, copyErr := executeCommandStrictForComputer(*sourceComputer, copyCmd)
+		if copyErr != nil {
 			writeJSON(w, http.StatusInternalServerError, APIResponse{
 				Success: false,
 				Error:   fmt.Sprintf("Copy failed: %v %s", copyErr, strings.TrimSpace(stderr)),
+			})
+			return
+		}
+
+		if req.Mode == "merge_newer" {
+			// For merge_newer, parse the OP_ID from stdout and record in DB.
+			var opID string
+			for _, line := range strings.Split(stderr, "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "OK:") {
+					opID = strings.TrimPrefix(line, "OK:")
+					break
+				}
+			}
+
+			backupPath := ""
+			if opID != "" {
+				backupPath = fmt.Sprintf("~/.pc-monitoring-undo/ops/%s/backup", opID)
+			}
+
+			mergeID, dbErr := insertMergeHistory(
+				req.SourceComputerID, sourcePath,
+				req.TargetComputerID, targetPath,
+				backupPath, []string{}, []string{},
+			)
+			if dbErr != nil {
+				log.Printf("WARNING: merge succeeded but failed to record history: %v", dbErr)
+			}
+
+			writeJSON(w, http.StatusOK, APIResponse{
+				Success: true,
+				Data: map[string]interface{}{
+					"sourceComputerId": req.SourceComputerID,
+					"targetComputerId": req.TargetComputerID,
+					"sourcePath":       sourcePath,
+					"targetPath":       targetPath,
+					"mergeId":          mergeID,
+					"opId":             opID,
+				},
 			})
 			return
 		}
@@ -1828,7 +1875,7 @@ echo "OK:$OP_ID"
 		return
 	}
 
-	if req.Mode == "merge_newer" && sourceType == "dir" {
+	if req.Mode == "merge_newer" {
 		// Merge-newer across computers with undo support:
 		// 1) extract tar to a temp dir
 		// 2) rsync --update --backup into targetPath
@@ -1838,7 +1885,7 @@ set -euo pipefail
 
 TARGET=%s
 
-command -v rsync >/dev/null 2>&1 || { echo "rsync is required for merge_newer + undo but is not installed"; exit 2; }
+command -v rsync >/dev/null 2>&1 || { echo "rsync is required for merge_newer + undo but is not installed" >&2; exit 2; }
 
 UNDO_BASE="$HOME/.pc-monitoring-undo"
 mkdir -p "$UNDO_BASE/ops"
@@ -1856,19 +1903,19 @@ trap cleanup EXIT
 tar -xf - -C "$TMP_DIR"
 
 # rsync output:
-# %i = itemized changes, %n = relative path
+# %%i = itemized changes, %%n = relative path
 RSYNC_LOG="$OP_DIR/rsync.log"
 rsync -a --update --backup --backup-dir="$BACKUP_DIR" --out-format='%%i|%%n' "$TMP_DIR"/ "$TARGET"/ | tee "$RSYNC_LOG" >/dev/null
 
 # Record created files so we can delete them on undo.
 # rsync itemize format: if first char is '>' and the second is 'f' or 'd', it's a transfer to receiver.
-# For newly created files/directories the "new" flag shows as '+++++++++' in %i.
+# For newly created files/directories the "new" flag shows as '+++++++++' in %%i.
 CREATED_LIST="$OP_DIR/created.txt"
 awk -F'\\|' '$1 ~ /^>\\+\\+\\+\\+\\+\\+\\+\\+\\+/ {print $2}' "$RSYNC_LOG" > "$CREATED_LIST" || true
 
 echo "$OP_ID" > "$UNDO_BASE/last_op"
-echo "OK:$OP_ID"
-`, shellQuote(targetPath)))))
+echo "OK:$OP_ID" >&2
+`, shellQuote(targetPath))))
 
 		if stderr, extractErr := streamCommandInputForComputer(*targetComputer, opScript, tmpFile); extractErr != nil {
 			writeJSON(w, http.StatusInternalServerError, APIResponse{
@@ -1876,8 +1923,46 @@ echo "OK:$OP_ID"
 				Error:   fmt.Sprintf("Failed to merge_newer into target: %v %s", extractErr, strings.TrimSpace(stderr)),
 			})
 			return
+		} else {
+			// Parse OP_ID from stderr (script writes "OK:<OP_ID>" to stderr).
+			var opID string
+			for _, line := range strings.Split(stderr, "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "OK:") {
+					opID = strings.TrimPrefix(line, "OK:")
+					break
+				}
+			}
+
+			backupPath := ""
+			if opID != "" {
+				backupPath = fmt.Sprintf("~/.pc-monitoring-undo/ops/%s/backup", opID)
+			}
+
+			mergeID, dbErr := insertMergeHistory(
+				req.SourceComputerID, sourcePath,
+				req.TargetComputerID, targetPath,
+				backupPath, []string{}, []string{},
+			)
+			if dbErr != nil {
+				log.Printf("WARNING: merge succeeded but failed to record history: %v", dbErr)
+			}
+
+			writeJSON(w, http.StatusOK, APIResponse{
+				Success: true,
+				Data: map[string]interface{}{
+					"sourceComputerId": req.SourceComputerID,
+					"targetComputerId": req.TargetComputerID,
+					"sourcePath":       sourcePath,
+					"targetPath":       targetPath,
+					"mergeId":          mergeID,
+					"opId":             opID,
+				},
+			})
+			return
 		}
 	} else {
+		// Normal copy/merge mode: extract tar archive into target directory.
 		extractArchiveCmd := fmt.Sprintf(
 			"mkdir -p %s && tar -xf - -C %s",
 			shellQuote(targetPath),
@@ -1886,7 +1971,7 @@ echo "OK:$OP_ID"
 		if stderr, extractErr := streamCommandInputForComputer(*targetComputer, extractArchiveCmd, tmpFile); extractErr != nil {
 			writeJSON(w, http.StatusInternalServerError, APIResponse{
 				Success: false,
-				Error:   fmt.Sprintf("Failed to write target data: %v %s", extractErr, strings.TrimSpace(stderr)),
+				Error:   fmt.Sprintf("Failed to extract into target: %v %s", extractErr, strings.TrimSpace(stderr)),
 			})
 			return
 		}
@@ -1899,111 +1984,11 @@ echo "OK:$OP_ID"
 			"targetComputerId": req.TargetComputerID,
 			"sourcePath":       sourcePath,
 			"targetPath":       targetPath,
-			"mode":             req.Mode,
 		},
 	})
 }
 
-// undoLastMerge handles POST /api/file-transfer/undo
-// Restores the last merge_newer operation on the selected computer.
-func undoLastMerge(w http.ResponseWriter, r *http.Request) {
-	setCORS(w)
-
-	var req FileTransferUndoRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: "Invalid JSON body"})
-		return
-	}
-	req.ComputerID = strings.TrimSpace(req.ComputerID)
-	if req.ComputerID == "" {
-		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: "computerId is required"})
-		return
-	}
-
-	computer, err := getComputerByID(req.ComputerID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "Failed to retrieve computers"})
-		return
-	}
-	if computer == nil {
-		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Error: "Computer not found"})
-		return
-	}
-
-	undoCmd := `bash -lc '
-set -euo pipefail
-command -v rsync >/dev/null 2>&1 || { echo "rsync is required for undo but is not installed"; exit 2; }
-
-UNDO_BASE="$HOME/.pc-monitoring-undo"
-LAST_FILE="$UNDO_BASE/last_op"
-if [ ! -f "$LAST_FILE" ]; then
-  echo "No merge operation to undo."
-  exit 3
-fi
-
-OP_ID="$(cat "$LAST_FILE" | tr -d "\r\n")"
-if [ -z "$OP_ID" ]; then
-  echo "No merge operation to undo."
-  exit 3
-fi
-
-OP_DIR="$UNDO_BASE/ops/$OP_ID"
-BACKUP_DIR="$OP_DIR/backup"
-CREATED_LIST="$OP_DIR/created.txt"
-RSYNC_LOG="$OP_DIR/rsync.log"
-
-if [ ! -d "$OP_DIR" ] || [ ! -d "$BACKUP_DIR" ]; then
-  echo "Undo data missing for last operation."
-  exit 4
-fi
-
-# Determine target directory used during merge by reading rsync log context.
-# We can’t reliably infer it later, so we store it if present.
-TARGET_FILE="$OP_DIR/target.txt"
-if [ ! -f "$TARGET_FILE" ]; then
-  echo "Undo target path missing."
-  exit 4
-fi
-TARGET="$(cat "$TARGET_FILE" | tr -d "\r\n")"
-if [ -z "$TARGET" ]; then
-  echo "Undo target path missing."
-  exit 4
-fi
-
-# 1) Restore overwritten/updated files from backup dir.
-rsync -a "$BACKUP_DIR"/ "$TARGET"/
-
-# 2) Remove files/dirs created by the merge.
-if [ -f "$CREATED_LIST" ]; then
-  # Delete files first, then directories (deepest-first).
-  while IFS= read -r rel; do
-    [ -z "$rel" ] && continue
-    rm -f "$TARGET/$rel" 2>/dev/null || true
-  done < "$CREATED_LIST"
-
-  # Now try removing any empty directories that were created.
-  tac "$CREATED_LIST" | while IFS= read -r rel; do
-    [ -z "$rel" ] && continue
-    rmdir "$TARGET/$rel" 2>/dev/null || true
-  done || true
-fi
-
-rm -f "$LAST_FILE"
-echo "OK"
-'`
-
-	// Run on the selected computer.
-	out, cmdErr := executeCommandStrictForComputer(*computer, undoCmd)
-	if cmdErr != nil {
-		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: strings.TrimSpace(out)})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]string{"computerId": req.ComputerID, "result": strings.TrimSpace(out)}})
-}
-
 // getComputerSystemInfo handles GET /api/system-info/:id
-// Collects host metrics via local shell (for this server) or SSH.
 func getComputerSystemInfo(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 
@@ -2016,23 +2001,14 @@ func getComputerSystemInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	computers, err := getComputers()
+	computer, err := getComputerByID(id)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{
 			Success: false,
-			Error:   "Failed to retrieve computers",
+			Error:   "Failed to retrieve computer",
 		})
 		return
 	}
-
-	var computer *Computer
-	for i := range computers {
-		if computers[i].ID == id {
-			computer = &computers[i]
-			break
-		}
-	}
-
 	if computer == nil {
 		writeJSON(w, http.StatusNotFound, APIResponse{
 			Success: false,
@@ -2051,7 +2027,6 @@ func getComputerSystemInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Persist OS version changes; future card refreshes show latest OS.
 	if info.OS != "" && info.OS != computer.OS {
 		if err := updateComputerOS(computer.ID, info.OS); err != nil {
 			log.Printf("WARNING: Failed to persist OS update for ID %s: %v", computer.ID, err)
@@ -2062,11 +2037,10 @@ func getComputerSystemInfo(w http.ResponseWriter, r *http.Request) {
 		Success: true,
 		Data:    info,
 	})
-	log.Printf("INFO: System info collected for %s@%s (%s): OS=%s", computer.Username, computer.Place, computer.IP, info.OS)
+	log.Printf("INFO: System info collected for %s@%s (%s)", computer.Username, computer.Place, computer.IP)
 }
 
 // getCPUOverview handles GET /api/cpu-overview/:id
-// Runs basic Linux commands and returns parsed CPU/RAM/storage/OS metrics.
 func getCPUOverview(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 
@@ -2079,23 +2053,14 @@ func getCPUOverview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	computers, err := getComputers()
+	computer, err := getComputerByID(id)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{
 			Success: false,
-			Error:   "Failed to retrieve computers",
+			Error:   "Failed to retrieve computer",
 		})
 		return
 	}
-
-	var computer *Computer
-	for i := range computers {
-		if computers[i].ID == id {
-			computer = &computers[i]
-			break
-		}
-	}
-
 	if computer == nil {
 		writeJSON(w, http.StatusNotFound, APIResponse{
 			Success: false,
@@ -2125,6 +2090,252 @@ func getCPUOverview(w http.ResponseWriter, r *http.Request) {
 		Data:    overview,
 	})
 	log.Printf("INFO: CPU overview collected for %s@%s (%s)", computer.Username, computer.Place, computer.IP)
+}
+
+// ============================================================================
+// Merge History & Unmerge (Rollback)
+// ============================================================================
+
+// UnmergeRequest represents the JSON body for POST /api/file-transfer/unmerge.
+type UnmergeRequest struct {
+	MergeID int `json:"mergeId"`
+}
+
+// unmergeComputerPath handles POST /api/file-transfer/unmerge
+// Rolls back a previous merge_newer operation, restoring backed-up files
+// and removing files that were newly created during the merge (git-style revert).
+func unmergeComputerPath(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+
+	var req UnmergeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "Invalid JSON body",
+		})
+		return
+	}
+
+	if req.MergeID <= 0 {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "mergeId is required and must be positive",
+		})
+		return
+	}
+
+	// Look up the merge record.
+	mergeRow, err := getMergeHistoryByID(req.MergeID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, APIResponse{
+			Success: false,
+			Error:   "Merge record not found",
+		})
+		return
+	}
+
+	if mergeRow.Status == "rolled_back" {
+		writeJSON(w, http.StatusConflict, APIResponse{
+			Success: false,
+			Error:   "This merge has already been rolled back",
+		})
+		return
+	}
+
+	if mergeRow.BackupPath == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "No backup path recorded for this merge — cannot rollback",
+		})
+		return
+	}
+
+	// Resolve the target computer to run the undo script on it.
+	targetComputer, err := getComputerByID(mergeRow.TargetMachineID)
+	if err != nil || targetComputer == nil {
+		writeJSON(w, http.StatusNotFound, APIResponse{
+			Success: false,
+			Error:   "Target computer not found",
+		})
+		return
+	}
+
+	// Extract the OP_ID from the backup path.
+	// Backup path format: ~/.pc-monitoring-undo/ops/<OP_ID>/backup
+	parts := strings.Split(mergeRow.BackupPath, "/")
+	var opID string
+	for i, part := range parts {
+		if part == "ops" && i+1 < len(parts) {
+			opID = parts[i+1]
+			break
+		}
+	}
+
+	if opID == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "Could not determine operation ID from backup path",
+		})
+		return
+	}
+
+	// Sanitize opID — it should only contain alphanumeric characters and underscores.
+	// This prevents shell injection when the value is interpolated into the undo script.
+	for _, ch := range opID {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_') {
+			writeJSON(w, http.StatusBadRequest, APIResponse{
+				Success: false,
+				Error:   "Invalid operation ID format",
+			})
+			return
+		}
+	}
+
+	// Run the undo script on the target computer.
+	// This script:
+	//   1. Restores backed-up files from the backup directory to the target folder
+	//   2. Deletes files that were newly created during the merge (listed in created.txt)
+	//   3. Cleans up the undo operation directory
+	undoScript := fmt.Sprintf(`bash -lc %s`, shellQuote(fmt.Sprintf(`
+set -euo pipefail
+
+OP_ID=%s
+UNDO_BASE="$HOME/.pc-monitoring-undo"
+OP_DIR="$UNDO_BASE/ops/$OP_ID"
+
+if [ ! -d "$OP_DIR" ]; then
+  echo "FAIL:undo operation directory not found: $OP_DIR" >&2
+  exit 1
+fi
+
+TARGET=$(cat "$OP_DIR/target.txt" 2>/dev/null || echo "")
+if [ -z "$TARGET" ]; then
+  echo "FAIL:target.txt missing or empty in undo operation" >&2
+  exit 1
+fi
+
+BACKUP_DIR="$OP_DIR/backup"
+CREATED_LIST="$OP_DIR/created.txt"
+
+# Step 1: Delete newly created files (reverse order so dirs are removed after their contents).
+if [ -f "$CREATED_LIST" ]; then
+  # Sort in reverse so child paths come before parent dirs.
+  sort -r "$CREATED_LIST" | while IFS= read -r rel; do
+    full="$TARGET/$rel"
+    if [ -f "$full" ]; then
+      rm -f "$full"
+    elif [ -d "$full" ]; then
+      rmdir "$full" 2>/dev/null || true
+    fi
+  done
+fi
+
+# Step 2: Restore backed-up files.
+if [ -d "$BACKUP_DIR" ] && [ "$(ls -A "$BACKUP_DIR" 2>/dev/null)" ]; then
+  cp -a "$BACKUP_DIR"/. "$TARGET"/
+fi
+
+# Step 3: Clean up the operation directory.
+rm -rf "$OP_DIR"
+
+# Update last_op if this was the most recent.
+LAST_OP=$(cat "$UNDO_BASE/last_op" 2>/dev/null || echo "")
+if [ "$LAST_OP" = "$OP_ID" ]; then
+  rm -f "$UNDO_BASE/last_op"
+fi
+
+echo "OK:rolled_back"
+`, opID)))
+
+	output, undoErr := executeCommandStrictForComputer(*targetComputer, undoScript)
+	if undoErr != nil {
+		// Check for FAIL: prefix in the output (could be in stderr or stdout).
+		for _, line := range strings.Split(output, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "FAIL:") {
+				writeJSON(w, http.StatusInternalServerError, APIResponse{
+					Success: false,
+					Error:   fmt.Sprintf("Rollback failed: %s", strings.TrimPrefix(line, "FAIL:")),
+				})
+				return
+			}
+		}
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Rollback failed: %v %s", undoErr, strings.TrimSpace(output)),
+		})
+		return
+	}
+
+	// Also check success output for unexpected FAIL: messages.
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "FAIL:") {
+			writeJSON(w, http.StatusInternalServerError, APIResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Rollback failed: %s", strings.TrimPrefix(line, "FAIL:")),
+			})
+			return
+		}
+	}
+
+	// Mark the merge as rolled back in the database.
+	if err := markMergeRolledBack(req.MergeID); err != nil {
+		log.Printf("WARNING: rollback succeeded on disk but failed to update DB: %v", err)
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]interface{}{
+			"mergeId":          req.MergeID,
+			"status":           "rolled_back",
+			"targetComputerId": mergeRow.TargetMachineID,
+			"targetFolder":     mergeRow.TargetFolder,
+		},
+	})
+	log.Printf("INFO: Merge #%d rolled back successfully on %s", req.MergeID, mergeRow.TargetMachineID)
+}
+
+// getMergeHistoryHandler handles GET /api/file-transfer/merge-history?targetComputerId=X&targetFolder=Y&limit=N
+// Returns the recent merge operations for a given target computer and folder.
+func getMergeHistoryHandler(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+
+	targetComputerID := strings.TrimSpace(r.URL.Query().Get("targetComputerId"))
+	targetFolder := strings.TrimSpace(r.URL.Query().Get("targetFolder"))
+
+	if targetComputerID == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "targetComputerId is required",
+		})
+		return
+	}
+
+	limit := 20
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if parsed, err := strconv.Atoi(limitStr); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+
+	history, err := getMergeHistory(targetComputerID, targetFolder, limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to retrieve merge history: %v", err),
+		})
+		return
+	}
+
+	if history == nil {
+		history = []MergeHistoryRow{}
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data:    history,
+	})
 }
 
 // ============================================================================
@@ -2410,6 +2621,284 @@ func handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 }
 
 // ============================================================================
+// MAC Address Discovery (internal – never exposed to frontend)
+// ============================================================================
+
+var macRegexp = regexp.MustCompile(`([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}`)
+
+// discoverMacAddress attempts to discover the MAC address of a host via ARP.
+// It first pings the host to populate the ARP cache, then reads from arp/ip neigh.
+func discoverMacAddress(ip string) (string, error) {
+	// Ping the host to populate ARP cache (ignore errors – we just need the side-effect)
+	exec.Command("ping", "-c", "1", "-W", "1", ip).Run()
+
+	// Try 'ip neigh show' first (modern Linux)
+	out, err := exec.Command("ip", "neigh", "show", ip).Output()
+	if err == nil {
+		if mac := macRegexp.FindString(string(out)); mac != "" {
+			return strings.ToLower(mac), nil
+		}
+	}
+
+	// Fallback to 'arp -n'
+	out, err = exec.Command("arp", "-n", ip).Output()
+	if err == nil {
+		if mac := macRegexp.FindString(string(out)); mac != "" {
+			return strings.ToLower(mac), nil
+		}
+	}
+
+	return "", fmt.Errorf("could not discover MAC for %s", ip)
+}
+
+// discoverAllMacAddresses runs MAC discovery for all registered computers.
+// Called as a background goroutine on server startup.
+func discoverAllMacAddresses() {
+	computers, err := getComputers()
+	if err != nil {
+		log.Printf("WARNING: MAC discovery failed to load computers: %v", err)
+		return
+	}
+
+	log.Printf("INFO: Starting MAC address discovery for %d computers...", len(computers))
+
+	var wg sync.WaitGroup
+	for _, c := range computers {
+		// Skip localhost/server entries – they don't need WOL
+		if isServerComputer(c) {
+			continue
+		}
+
+		wg.Add(1)
+		go func(comp Computer) {
+			defer wg.Done()
+			mac, err := discoverMacAddress(comp.IP)
+			if err != nil {
+				log.Printf("WARNING: MAC discovery failed for %s (%s): %v", comp.Place, comp.IP, err)
+				return
+			}
+			if err := upsertMacAddress(comp.ID, mac); err != nil {
+				log.Printf("ERROR: Failed to store MAC for %s: %v", comp.ID, err)
+				return
+			}
+			log.Printf("INFO: Discovered MAC for %s (%s): %s", comp.Place, comp.IP, mac)
+		}(c)
+	}
+	wg.Wait()
+	log.Println("INFO: MAC address discovery complete")
+}
+
+// discoverMacForComputer discovers and stores the MAC for a single computer.
+// Used when a new computer is added.
+func discoverMacForComputer(c Computer) {
+	if isServerComputer(c) {
+		return
+	}
+	go func() {
+		mac, err := discoverMacAddress(c.IP)
+		if err != nil {
+			log.Printf("WARNING: MAC discovery failed for new computer %s (%s): %v", c.Place, c.IP, err)
+			return
+		}
+		if err := upsertMacAddress(c.ID, mac); err != nil {
+			log.Printf("ERROR: Failed to store MAC for %s: %v", c.ID, err)
+			return
+		}
+		log.Printf("INFO: Discovered MAC for new computer %s (%s): %s", c.Place, c.IP, mac)
+	}()
+}
+
+// ============================================================================
+// Wake-on-LAN
+// ============================================================================
+
+// sendWakeOnLAN constructs and sends a WOL magic packet to the broadcast address.
+func sendWakeOnLAN(macAddr string) error {
+	// Normalize MAC address separators
+	macAddr = strings.ReplaceAll(macAddr, "-", ":")
+	parts := strings.Split(macAddr, ":")
+	if len(parts) != 6 {
+		return fmt.Errorf("invalid MAC address: %s", macAddr)
+	}
+
+	var hwAddr [6]byte
+	for i, p := range parts {
+		val, err := strconv.ParseUint(p, 16, 8)
+		if err != nil {
+			return fmt.Errorf("invalid MAC byte %q: %w", p, err)
+		}
+		hwAddr[i] = byte(val)
+	}
+
+	// Build magic packet: 6 bytes of 0xFF + 16 repetitions of the MAC address
+	var buf bytes.Buffer
+	// 6 × 0xFF header
+	for i := 0; i < 6; i++ {
+		buf.WriteByte(0xFF)
+	}
+	// 16 × MAC address
+	for i := 0; i < 16; i++ {
+		binary.Write(&buf, binary.BigEndian, hwAddr)
+	}
+
+	// Send via UDP broadcast on port 9
+	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{
+		IP:   net.IPv4bcast,
+		Port: 9,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to open UDP socket: %w", err)
+	}
+	defer conn.Close()
+
+	_, err = conn.Write(buf.Bytes())
+	if err != nil {
+		return fmt.Errorf("failed to send magic packet: %w", err)
+	}
+
+	log.Printf("INFO: WOL magic packet sent to %s", macAddr)
+	return nil
+}
+
+// handleWakeComputer handles POST /api/wake/:id
+func handleWakeComputer(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+
+	id := strings.TrimPrefix(r.URL.Path, "/api/wake/")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Error:   "Missing computer ID",
+		})
+		return
+	}
+
+	computer, err := getComputerByID(id)
+	if err != nil || computer == nil {
+		writeJSON(w, http.StatusNotFound, APIResponse{
+			Success: false,
+			Error:   "Computer not found",
+		})
+		return
+	}
+
+	mac, err := getMacAddress(id)
+	if err != nil || mac == "" {
+		// Try to discover MAC on the fly
+		mac, err = discoverMacAddress(computer.IP)
+		if err != nil || mac == "" {
+			writeJSON(w, http.StatusNotFound, APIResponse{
+				Success: false,
+				Error:   "MAC address not found. The computer must be online at least once for MAC discovery.",
+			})
+			return
+		}
+		// Store the discovered MAC for future use
+		_ = upsertMacAddress(id, mac)
+	}
+
+	if err := sendWakeOnLAN(mac); err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to send WOL packet: %v", err),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]string{
+			"id":      id,
+			"message": fmt.Sprintf("Wake-on-LAN packet sent to %s (%s)", computer.Place, computer.IP),
+		},
+	})
+	log.Printf("INFO: WOL packet sent for %s (%s) via MAC %s", computer.Place, computer.IP, mac)
+}
+
+// ============================================================================
+// Periodic Health Check
+// ============================================================================
+
+const healthCheckInterval = 60 * time.Second
+
+// healthCheckLoop runs in a background goroutine, pinging all computers
+// every healthCheckInterval and storing the result in the health_status table.
+func healthCheckLoop() {
+	// Run the first check immediately on startup
+	runHealthCheck()
+
+	ticker := time.NewTicker(healthCheckInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		runHealthCheck()
+	}
+}
+
+// runHealthCheck pings all computers and updates the health_status table.
+func runHealthCheck() {
+	allComputers, err := getComputers()
+	if err != nil {
+		log.Printf("WARNING: Health check failed to load computers: %v", err)
+		return
+	}
+
+	if len(allComputers) == 0 {
+		return
+	}
+
+	var wg sync.WaitGroup
+	onCount := 0
+	var mu sync.Mutex
+
+	for _, c := range allComputers {
+		wg.Add(1)
+		go func(comp Computer) {
+			defer wg.Done()
+
+			status := pingHost(comp.IP)
+			osName := comp.OS
+
+			if err := upsertHealthStatus(comp.ID, status, osName); err != nil {
+				log.Printf("WARNING: Health check failed to store status for %s: %v", comp.ID, err)
+			}
+
+			mu.Lock()
+			if status == "ON" {
+				onCount++
+			}
+			mu.Unlock()
+		}(c)
+	}
+	wg.Wait()
+
+	log.Printf("INFO: Health check complete — %d/%d online", onCount, len(allComputers))
+}
+
+// handleGetHealthStatus handles GET /api/health-status
+func handleGetHealthStatus(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+
+	statuses, err := getHealthStatuses()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Error:   "Failed to retrieve health statuses",
+		})
+		return
+	}
+
+	if statuses == nil {
+		statuses = []HealthStatusRow{}
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data:    statuses,
+	})
+}
+
+// ============================================================================
 // Router
 // ============================================================================
 
@@ -2444,15 +2933,21 @@ func router(w http.ResponseWriter, r *http.Request) {
 	case path == "/api/terminal/execute" && r.Method == http.MethodPost:
 		executeTerminal(w, r)
 	case path == "/api/terminal/ws" && r.Method == http.MethodGet:
-		handleTerminalWS(w, r) // ✅ WebSocket route correctly placed here
+		handleTerminalWS(w, r)
 	case path == "/api/file-transfer/list" && r.Method == http.MethodGet:
 		listComputerFiles(w, r)
 	case path == "/api/file-transfer/download" && r.Method == http.MethodGet:
 		downloadComputerPath(w, r)
 	case path == "/api/file-transfer/copy" && r.Method == http.MethodPost:
 		copyComputerPath(w, r)
-	case path == "/api/file-transfer/undo" && r.Method == http.MethodPost:
-		undoLastMerge(w, r)
+	case path == "/api/file-transfer/unmerge" && r.Method == http.MethodPost:
+		unmergeComputerPath(w, r)
+	case path == "/api/file-transfer/merge-history" && r.Method == http.MethodGet:
+		getMergeHistoryHandler(w, r)
+	case strings.HasPrefix(path, "/api/wake/") && r.Method == http.MethodPost:
+		handleWakeComputer(w, r)
+	case path == "/api/health-status" && r.Method == http.MethodGet:
+		handleGetHealthStatus(w, r)
 	default:
 		http.FileServer(http.Dir("../frontend")).ServeHTTP(w, r)
 	}
@@ -2469,17 +2964,35 @@ func main() {
 	}
 	defer closeDatabase()
 
+	// Start background MAC address discovery
+	go discoverAllMacAddresses()
+
+	// Start background health check loop (pings all computers every 60s)
+	go healthCheckLoop()
+
 	// Register router
 	http.HandleFunc("/", router)
 
-	port := ":8081"
+	bindHost := os.Getenv("SERVER_HOST")
+	if bindHost == "" {
+		bindHost = "0.0.0.0"
+	}
+	port := "8081"
+	address := net.JoinHostPort(bindHost, port)
+	localAddress := "localhost"
+	if conn, err := net.Dial("udp", "8.8.8.8:80"); err == nil {
+		localAddress = conn.LocalAddr().(*net.UDPAddr).IP.String()
+		conn.Close()
+	}
 	log.Printf("========================================")
 	log.Printf("Network PC Monitoring System - Started")
-	log.Printf("Server running at http://localhost%s", port)
+	log.Printf("Server listening on %s", address)
+	log.Printf("Open from this network at http://%s:%s", localAddress, port)
 	log.Printf("Database: %s", dbPath)
+	log.Printf("Health check interval: %s", healthCheckInterval)
 	log.Printf("========================================")
 
-	if err := http.ListenAndServe(port, nil); err != nil {
+	if err := http.ListenAndServe(address, nil); err != nil {
 		log.Fatalf("FATAL: Server failed to start: %v", err)
 	}
 }
